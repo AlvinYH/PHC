@@ -14,11 +14,6 @@ import torch.nn.functional as F
 
 from phc.env.tasks.humanoid_im import HumanoidIm
 from phc.utils.flags import flags
-from pipeline.physics.mimic.contact_pairs import (
-    aggregate_rigid_contact_body_matrix,
-    aggregate_rigid_contact_pairs,
-    summarize_handle_contact_pairs,
-)
 from pipeline.physics.mimic.collision_distance import (
     box_region_surface_distances,
     capsule_region_surface_distances,
@@ -92,17 +87,11 @@ class HumanoidImPassiveObject(HumanoidIm):
             self._phc_contact_region_point_body_names,
         ) = self._load_contact_region_points(object_config)
 
-        # These fields are diagnostic runtime controls, not case data. Training
-        # leaves them absent; evaluation writes both explicitly.
+        # This field is a diagnostic runtime control, not case data.
         self._phc_eval_start_frame = (
             int(env_cfg["phcEvalStartFrame"])
             if "phcEvalStartFrame" in env_cfg
             else None
-        )
-        self._phc_exact_contact_telemetry = (
-            bool(env_cfg["phcExactContactTelemetry"])
-            if "phcExactContactTelemetry" in env_cfg
-            else False
         )
 
         # Isaac Gym calls the overridden asset/env builders from super().__init__,
@@ -154,16 +143,6 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._phc_hand_box_quaternions_local = None
         self._phc_hand_box_half_extents = None
         self._phc_hand_box_valid = None
-        self._phc_exact_contact_humanoid_env_body_indices = None
-        self._phc_exact_contact_all_humanoid_env_body_indices = None
-        self._phc_exact_contact_target_env_body_indices = None
-        self._phc_exact_env_body_names = []
-        # Isaac Gym exact rigid-contact pair reads are CPU-only telemetry.
-        if self._phc_exact_contact_telemetry and bool(sim_params.use_gpu_pipeline):
-            raise RuntimeError(
-                "phcExactContactTelemetry requires use_gpu_pipeline=False"
-            )
-
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
 
         self._build_target_tensors()
@@ -526,159 +505,6 @@ class HumanoidImPassiveObject(HumanoidIm):
         hand_ids = sorted(set(self._left_hand_body_ids + self._right_hand_body_ids))
         self._phc_contact_hand_body_ids = torch.tensor(hand_ids, dtype=torch.long, device=self.device)
         self._phc_contact_label_body_ids = self._resolve_contact_label_body_ids()
-        if self._phc_exact_contact_telemetry:
-            self._build_exact_contact_index_maps()
-
-    def _build_exact_contact_index_maps(self):
-        """Cache environment-domain rigid-body indices for exact pair reads."""
-
-        label_local = [
-            int(value)
-            for value in self._phc_contact_label_body_ids.detach().cpu().tolist()
-        ]
-
-        humanoid_indices = []
-        all_humanoid_indices = []
-        target_indices = []
-        for env_idx, env_ptr in enumerate(self.envs):
-            humanoid_handle = self.humanoid_handles[env_idx]
-            target_handle = self._target_handles[env_idx]
-            humanoid_row = []
-            for body_local in label_local:
-                if body_local < 0:
-                    humanoid_row.append(-1)
-                else:
-                    humanoid_row.append(
-                        int(
-                            self.gym.get_actor_rigid_body_index(
-                                env_ptr,
-                                humanoid_handle,
-                                int(body_local),
-                                gymapi.DOMAIN_ENV,
-                            )
-                        )
-                    )
-            target_row = [
-                int(
-                    self.gym.get_actor_rigid_body_index(
-                        env_ptr,
-                        target_handle,
-                        int(body_local),
-                        gymapi.DOMAIN_ENV,
-                    )
-                )
-                for body_local in range(int(self._target_asset_body_count))
-            ]
-            all_humanoid_row = [
-                int(
-                    self.gym.get_actor_rigid_body_index(
-                        env_ptr,
-                        humanoid_handle,
-                        int(body_local),
-                        gymapi.DOMAIN_ENV,
-                    )
-                )
-                for body_local in range(int(self.num_bodies))
-            ]
-            humanoid_indices.append(humanoid_row)
-            all_humanoid_indices.append(all_humanoid_row)
-            target_indices.append(target_row)
-
-        self._phc_exact_contact_humanoid_env_body_indices = np.asarray(
-            humanoid_indices, dtype=np.int64
-        )
-        self._phc_exact_contact_target_env_body_indices = np.asarray(
-            target_indices, dtype=np.int64
-        )
-        self._phc_exact_contact_all_humanoid_env_body_indices = np.asarray(
-            all_humanoid_indices, dtype=np.int64
-        )
-        bodies_per_env = int(self._rigid_body_state_reshaped.shape[1])
-        env_body_names = [f"unknown:{idx}" for idx in range(bodies_per_env)]
-        if self.envs:
-            env_ptr = self.envs[0]
-            actor_specs = [
-                ("humanoid", self.humanoid_handles[0]),
-                ("object", self._target_handles[0]),
-                ("filtered_ground", self._target_filtered_ground_handles[0]),
-            ]
-            for actor_prefix, actor_handle in actor_specs:
-                actor_names = self.gym.get_actor_rigid_body_names(env_ptr, actor_handle)
-                for actor_local, body_name in enumerate(actor_names):
-                    env_body_idx = int(
-                        self.gym.get_actor_rigid_body_index(
-                            env_ptr,
-                            actor_handle,
-                            int(actor_local),
-                            gymapi.DOMAIN_ENV,
-                        )
-                    )
-                    if 0 <= env_body_idx < bodies_per_env:
-                        env_body_names[env_body_idx] = f"{actor_prefix}:{body_name}"
-        self._phc_exact_env_body_names = env_body_names
-
-    def _compute_exact_contact_pair_telemetry(self, frame_indices):
-        """Return true fingertip-object rigid-body collision-pair statistics."""
-
-        if not self._phc_exact_contact_telemetry:
-            return None
-        humanoid_indices = self._phc_exact_contact_humanoid_env_body_indices
-        target_indices = self._phc_exact_contact_target_env_body_indices
-        all_humanoid_indices = self._phc_exact_contact_all_humanoid_env_body_indices
-        num_labels = int(humanoid_indices.shape[1])
-        num_target_bodies = int(target_indices.shape[1])
-        pair_count = np.zeros(
-            (self.num_envs, num_labels, num_target_bodies), dtype=np.int32
-        )
-        all_pair_count = np.zeros(
-            (self.num_envs, int(self.num_bodies), num_target_bodies), dtype=np.int32
-        )
-        bodies_per_env = int(self._rigid_body_state_reshaped.shape[1])
-        env_pair_count = np.zeros(
-            (self.num_envs, bodies_per_env, bodies_per_env), dtype=np.int32
-        )
-        for env_idx, env_ptr in enumerate(self.envs):
-            contacts = self.gym.get_env_rigid_contacts(env_ptr)
-            env_aggregation = aggregate_rigid_contact_body_matrix(
-                contacts, num_bodies=bodies_per_env
-            )
-            env_pair_count[env_idx] = env_aggregation.count
-            aggregation = aggregate_rigid_contact_pairs(
-                contacts,
-                humanoid_body_indices=humanoid_indices[env_idx],
-                target_body_indices=target_indices[env_idx],
-            )
-            pair_count[env_idx] = aggregation.count
-            all_aggregation = aggregate_rigid_contact_pairs(
-                contacts,
-                humanoid_body_indices=all_humanoid_indices[env_idx],
-                target_body_indices=target_indices[env_idx],
-            )
-            all_pair_count[env_idx] = all_aggregation.count
-
-        active_label, _ = self._contact_ref_for_frames(frame_indices)
-        active_mask = active_label.detach().cpu().numpy()[:, :num_labels] > 0.0
-        region_body_ids = self._phc_contact_region_body_local_ids
-        if region_body_ids is None:
-            region_ids = []
-        else:
-            region_ids = [int(value) for value in region_body_ids.detach().cpu().tolist()]
-        summary = summarize_handle_contact_pairs(
-            pair_count,
-            active_label_mask=active_mask,
-            target_region_body_indices=region_ids,
-        )
-        return {
-            "exact_contact_pair_count": pair_count.astype(np.float32),
-            "exact_humanoid_target_pair_count": all_pair_count.astype(np.float32),
-            "exact_env_body_pair_count": env_pair_count.astype(np.float32),
-            "exact_any_humanoid_target_contact_count": all_pair_count.sum(
-                axis=(1, 2), dtype=np.int32
-            ).astype(np.float32),
-            "exact_handle_contact_count": summary.any_label_count.astype(np.float32),
-            "exact_active_handle_contact_count": summary.active_label_count.astype(np.float32),
-        }
-
     def _hand_body_ids(self, side_prefix: str):
         names = list(self._body_names)
         suffixes = ("Wrist", "Hand", "Index", "Middle", "Pinky", "Ring", "Thumb")
@@ -1098,14 +924,13 @@ class HumanoidImPassiveObject(HumanoidIm):
                 "label_force": self._contact_label_force_norm().detach().cpu().numpy(),
                 "intended": labels.detach().cpu().numpy(),
                 "object_reference": contact_obj.detach().cpu().numpy(),
+                "hand_force_n": np.stack((left_force, right_force), axis=-1),
+                "region_force_n": self._target_contact_region_force_norm().detach().cpu().numpy(),
                 "target_force": target_force,
                 "target_force_by_body": target_force_by_body,
                 "left_hand_force": left_force,
                 "right_hand_force": right_force,
             }
-            exact_telemetry = self._compute_exact_contact_pair_telemetry(frame_indices)
-            if exact_telemetry is not None:
-                contact["exact"] = exact_telemetry
             self.extras["physics_rollout"] = {
                 "object": {
                     "qpos": qpos_sim.detach().cpu().numpy(),

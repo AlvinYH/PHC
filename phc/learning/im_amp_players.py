@@ -302,16 +302,13 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
                             "human_body_names": list(
                                 getattr(humanoid_env, "_body_names", [])
                             ),
-                            "exact_body_names": list(
-                                getattr(humanoid_env, "_phc_exact_env_body_names", [])
-                            ),
                             "label_names": list(
                                 getattr(humanoid_env, "_phc_contact_label_names_10", [])
                             ),
                             "granularity": str(
                                 getattr(humanoid_env, "_phc_contact_granularity", "none")
                             ),
-                            "source": "contact_region_distance_with_exact_rigid_pairs",
+                            "source": "surface_distance_and_net_contact_force",
                         },
                     }
                     tracked_root_states_all = self.tracked_root_states_all[: humanoid_env._motion_lib._num_unique_motions]
