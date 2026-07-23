@@ -3,6 +3,7 @@ task: HumanoidIm
 project_name: "PHC_X"
 notes:  "obs_v6 PHC, huge model. Auto pmcp soft. Box body. real_weight_porpotion_boxes set to True. This makes the humanoid a little heavier."
 motion_file: ""
+fix_height: no_fix
 num_envs: 3072
 env_spacing: 5
 episode_length: 300
@@ -79,8 +80,7 @@ enableTaskObs: True
 
 
 plane:
+  height: 0.0
   staticFriction: 1.0
   dynamicFriction: 1.0
   restitution: 0.0
-
-

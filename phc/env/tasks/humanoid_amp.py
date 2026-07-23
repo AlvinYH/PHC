@@ -117,7 +117,7 @@ class HumanoidAMP(Humanoid):
 
         self._amp_obs_demo_buf = None
 
-        data_dir = "data/smpl"
+        data_dir = cfg["robot"]["smpl_data_root"]
         
         if self.humanoid_type in ["smpl", ]:
             self.smpl_parser_n = SMPL_Parser(model_path=data_dir, gender="neutral").to(self.device)
@@ -1102,5 +1102,4 @@ def build_amp_observations_robot(root_pos, root_rot, root_vel, root_ang_vel, dof
     obs = torch.cat(obs_list, dim=-1)
     
     return obs
-
 

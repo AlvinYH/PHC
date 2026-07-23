@@ -47,7 +47,7 @@ class MotionLibSMPL(MotionLibBase):
     def __init__(self, motion_lib_cfg):
         super().__init__(motion_lib_cfg = motion_lib_cfg)
         
-        data_dir = "data/smpl"
+        data_dir = motion_lib_cfg.smpl_data_root
         
         if osp.exists(data_dir):
             if motion_lib_cfg.smpl_type == "smpl":
@@ -179,6 +179,3 @@ class MotionLibSMPL(MotionLibBase):
         else:
             return res
 
-
-    
-    

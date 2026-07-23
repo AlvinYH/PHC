@@ -190,8 +190,9 @@ class Humanoid(BaseTask):
             self.vec_sensor_tensor = gymtorch.wrap_tensor(sensor_tensor).view(self.num_envs, sensors_per_env * 6)
         
 
-        dof_force_tensor = self.gym.acquire_dof_force_tensor(self.sim)
-        self.dof_force_tensor = gymtorch.wrap_tensor(dof_force_tensor).view(self.num_envs, self.num_dof)
+        dof_force_tensor = gymtorch.wrap_tensor(self.gym.acquire_dof_force_tensor(self.sim))
+        dofs_per_env = dof_force_tensor.shape[0] // self.num_envs
+        self.dof_force_tensor = dof_force_tensor.view(self.num_envs, dofs_per_env)[..., :self.num_dof]
 
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
@@ -249,6 +250,7 @@ class Humanoid(BaseTask):
 
     def load_humanoid_configs(self, cfg):
         self.humanoid_type = cfg.robot.humanoid_type
+        self._use_case_shape = bool(cfg.robot.get("use_case_shape", False))
         if self.humanoid_type in ["smpl", "smplh", "smplx"]:
             self.load_smpl_configs(cfg)
         elif self.humanoid_type in ['h1', 'g1']:
@@ -623,6 +625,7 @@ class Humanoid(BaseTask):
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
+        plane_params.distance = -float(self.cfg["env"]["plane"].get("height", 0.0))
         plane_params.static_friction = self.plane_static_friction
         plane_params.dynamic_friction = self.plane_dynamic_friction
 
@@ -758,6 +761,9 @@ class Humanoid(BaseTask):
             return res
 
     def _load_amass_gender_betas(self):
+        if self._use_case_shape:
+            self._amass_gender_betas = np.zeros((1, 17), dtype=np.float32)
+            return
         if self._has_mesh:
             gender_betas_data = joblib.load("sample_data/amass_isaac_gender_betas.pkl")
             self._amass_gender_betas = np.array(list(gender_betas_data.values()))
@@ -800,7 +806,10 @@ class Humanoid(BaseTask):
                 "model": self.humanoid_type,
                 "sim": "isaacgym"
             }
-            if os.path.exists("data/smpl"):
+            use_case_shape = bool(self.cfg.robot.get("use_case_shape", False))
+            if use_case_shape:
+                robot = None
+            elif os.path.exists("data/smpl"):
                 robot = SMPL_Robot(
                     robot_cfg,
                     data_dir="data/smpl",
@@ -821,7 +830,22 @@ class Humanoid(BaseTask):
             asset_options.max_angular_velocity = 100.0
             asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
 
-            if self.has_shape_variation:
+            if use_case_shape:
+                asset_file_real = os.path.join(asset_root, asset_file)
+                if not os.path.isfile(asset_file_real):
+                    raise FileNotFoundError(f"Missing case humanoid asset: {asset_file_real}")
+                sk_tree = SkeletonTree.from_mjcf(asset_file_real)
+                humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+                actuator_props = self.gym.get_asset_actuator_properties(humanoid_asset)
+                motor_efforts = [prop.motor_effort for prop in actuator_props]
+
+                if self.self_obs_v == 3:
+                    self.create_humanoid_force_sensors(humanoid_asset, self.force_sensor_joints)
+
+                self.humanoid_shapes = torch.zeros((num_envs, 17), dtype=torch.float32, device=self.device)
+                self.humanoid_assets = [humanoid_asset] * num_envs
+                self.skeleton_trees = [sk_tree] * num_envs
+            elif self.has_shape_variation:
                 
                 queue = mp.Queue()
                 num_jobs = min(mp.cpu_count(), 64)

@@ -49,8 +49,11 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self.load_humanoid_configs(cfg)
         self.cfg = cfg
         self.num_envs = cfg["env"]["num_envs"]
-        self.device_type = cfg.get("device_type", "cuda")
-        self.device_id = cfg.get("device_id", 0)
+        # Honor the constructor arguments before Humanoid.__init__ writes them
+        # back into cfg.  Reading cfg here defaulted to CUDA and made PHC's
+        # documented CPU tensor pipeline fail with CUDA index tensors.
+        self.device_type = device_type
+        self.device_id = device_id
         self.headless = cfg["headless"]
         #self.start_idx = 0
 
@@ -317,15 +320,21 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         assert (self._dof_offsets[-1] == self.num_dof)
 
         if self.humanoid_type in ["smpl", "smplh", "smplx"]:
+            fix_height_name = str(self.cfg["env"]["fix_height"])
+            try:
+                fix_height = FixHeightMode[fix_height_name]
+            except KeyError as exc:
+                raise ValueError(f"Unsupported env.fix_height={fix_height_name!r}") from exc
             motion_lib_cfg = EasyDict({
                 "motion_file": motion_train_file,
                 "device": torch.device("cpu"),
-                "fix_height": FixHeightMode.full_fix,
+                "fix_height": fix_height,
                 "min_length": self._min_motion_len,
                 "max_length": -1,
                 "im_eval": flags.im_eval,
                 "multi_thread": not self.cfg.disable_multiprocessing ,
                 "smpl_type": self.humanoid_type,
+                "smpl_data_root": self.cfg.robot.smpl_data_root,
                 "randomrize_heading": True,
                 "device": self.device,
                 "step_dt": self.dt,
