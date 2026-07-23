@@ -552,10 +552,13 @@ class CommonAgent(a2c_continuous.A2CAgent):
     def _eval_critic(self, obs_dict):
         self.model.eval()
         obs_dict['obs'] = self._preproc_obs(obs_dict['obs'])
-        if self.model.is_rnn():
-            value, state = self.model.a2c_network.eval_critic(obs_dict)
+        network = self.model.a2c_network
+        if not hasattr(network, "eval_critic"):
+            value = self.model({**obs_dict, "is_train": False})["values"]
+        elif self.model.is_rnn():
+            value, state = network.eval_critic(obs_dict)
         else:
-            value = self.model.a2c_network.eval_critic(obs_dict)
+            value = network.eval_critic(obs_dict)
 
         if self.normalize_value:
             value = self.value_mean_std(value, True)
@@ -1034,10 +1037,13 @@ class CommonDiscreteAgent(a2c_discrete.DiscreteA2CAgent):
     def _eval_critic(self, obs_dict):
         self.model.eval()
         obs_dict['obs'] = self._preproc_obs(obs_dict['obs'])
-        if self.model.is_rnn():
-            value, state = self.model.a2c_network.eval_critic(obs_dict)
+        network = self.model.a2c_network
+        if not hasattr(network, "eval_critic"):
+            value = self.model({**obs_dict, "is_train": False})["values"]
+        elif self.model.is_rnn():
+            value, state = network.eval_critic(obs_dict)
         else:
-            value = self.model.a2c_network.eval_critic(obs_dict)
+            value = network.eval_critic(obs_dict)
 
         if self.normalize_value:
             value = self.value_mean_std(value, True)
