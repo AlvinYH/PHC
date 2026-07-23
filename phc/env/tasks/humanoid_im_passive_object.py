@@ -932,7 +932,15 @@ class HumanoidImPassiveObject(HumanoidIm):
                 "right_hand_force": right_force,
             }
             self.extras["physics_rollout"] = {
+                "human": {
+                    "root_state": self._humanoid_root_states.detach().cpu().numpy(),
+                    "dof_pos": self._dof_pos.detach().cpu().numpy(),
+                    "body_state": self._rigid_body_state.view(
+                        self.num_envs, -1, 13
+                    )[:, : self.num_bodies].detach().cpu().numpy(),
+                },
                 "object": {
+                    "root_state": self._target_states.detach().cpu().numpy(),
                     "qpos": qpos_sim.detach().cpu().numpy(),
                     "qpos_reference": qpos_ref.detach().cpu().numpy(),
                     "frame": frame_indices.detach().cpu().numpy(),
