@@ -26,3 +26,4 @@ real_weight_porpotion_boxes: True
 asset:
     assetRoot: "/"
     assetFileName: "mjcf/smpl_humanoid.xml"
+    generatedHumanoidXmlDir: "data/smpl/generated_mjcf"

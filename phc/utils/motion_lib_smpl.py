@@ -80,7 +80,9 @@ class MotionLibSMPL(MotionLibBase):
             betas = curr_gender_betas[1:]
             mesh_parser = mesh_parsers[gender.item()]
             height_tolorance = 0.0
-            vertices_curr, joints_curr = mesh_parser.get_joints_verts(pose_aa[:frame_check], betas[None,], trans[:frame_check])
+            pose_check = pose_aa[:frame_check]
+            beta_check = betas[None].expand(pose_check.shape[0], -1)
+            vertices_curr, joints_curr = mesh_parser.get_joints_verts(pose_check, beta_check, trans[:frame_check])
             
             offset = joints_curr[:, 0] - trans[:frame_check] # account for SMPL root offset. since the root trans we pass in has been processed, we have to "add it back".
             
@@ -178,6 +180,5 @@ class MotionLibSMPL(MotionLibBase):
             queue.put(res)
         else:
             return res
-
 
 

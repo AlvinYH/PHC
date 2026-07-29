@@ -746,7 +746,14 @@ class Humanoid(BaseTask):
             
             if not smpl_robot is None:
                 asset_id = uuid4()
-                asset_file_real = f"/tmp/smpl/smpl_humanoid_{asset_id}.xml"
+                generated_xml_dir = os.path.abspath(
+                    self.cfg.robot.asset["generatedHumanoidXmlDir"]
+                )
+                os.makedirs(generated_xml_dir, exist_ok=True)
+                asset_file_real = os.path.join(
+                    generated_xml_dir,
+                    f"smpl_humanoid_{asset_id}.xml",
+                )
                 smpl_robot.load_from_skeleton(betas=torch.from_numpy(gender_beta[None, 1:]), gender=gender_beta[0:1], objs_info=None)
                 smpl_robot.write_xml(asset_file_real)
             else:
