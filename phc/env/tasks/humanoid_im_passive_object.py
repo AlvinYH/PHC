@@ -154,10 +154,7 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._phc_contact_label_body_ids = self._resolve_contact_label_body_ids()
 
     def _load_contact_label_capsules(self):
-        from pipeline.physics.contact import (
-            load_mjcf_body_boxes,
-            load_mjcf_body_capsules,
-        )
+        from pipeline.physics.contact import load_hand_collision_geometry
 
         asset_cfg = self.cfg["robot"]["asset"]
         asset_root = Path(asset_cfg["assetRoot"]).expanduser()
@@ -167,9 +164,15 @@ class HumanoidImPassiveObject(HumanoidIm):
             self._contact_label_to_body_name(label)
             for label in self._phc_contact_label_names_10
         )
-        capsule_endpoints, capsule_radii, capsule_valid = load_mjcf_body_capsules(
-            path, list(label_body_names)
-        )
+        (
+            capsule_endpoints,
+            capsule_radii,
+            capsule_valid,
+            _label_box_centers,
+            _label_box_quaternions,
+            _label_box_half_extents,
+            _label_box_valid,
+        ) = load_hand_collision_geometry(path, label_body_names)
         if not bool(capsule_valid.all()):
             missing = [
                 name for name, valid in zip(label_body_names, capsule_valid.tolist())
@@ -191,13 +194,15 @@ class HumanoidImPassiveObject(HumanoidIm):
         hand_groups = (tuple(self._left_hand_body_ids), tuple(self._right_hand_body_ids))
         flat_ids = tuple(body_id for group in hand_groups for body_id in group)
         hand_names = [str(self._body_names[body_id]) for body_id in flat_ids]
-        hand_capsule_endpoints, hand_capsule_radii, hand_capsule_valid = load_mjcf_body_capsules(path, hand_names)
         (
+            hand_capsule_endpoints,
+            hand_capsule_radii,
+            hand_capsule_valid,
             hand_box_centers,
             hand_box_quaternions,
             hand_box_half_extents,
             hand_box_valid,
-        ) = load_mjcf_body_boxes(path, hand_names)
+        ) = load_hand_collision_geometry(path, hand_names)
         if not bool(np.logical_or(hand_capsule_valid, hand_box_valid).all()):
             missing = [
                 name
@@ -635,13 +640,12 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._write_target_reset_joint_qpos(env_ids)
 
     def _write_target_reset_joint_qpos(self, env_ids):
-        """Use case q0 at frame zero and the absolute reference for later RSI frames."""
+        """Reset every object joint to the case-defined physical initial state."""
 
         if self._target_initial_joint_qpos is None:
             raise RuntimeError("Missing case-level target initial joint qpos")
         frames = self._target_frame_indices(env_ids)
-        reset_qpos = self._target_qpos_ref_for_frames(frames).clone()
-        reset_qpos[frames == 0] = self._target_initial_joint_qpos
+        reset_qpos = self._target_initial_joint_qpos.expand(len(env_ids), -1)
         self._target_dof_pos[env_ids, :] = reset_qpos
         self._target_dof_vel[env_ids, :] = 0.0
         if self._target_last_reset_joint_qpos is None:
