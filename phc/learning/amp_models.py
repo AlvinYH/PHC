@@ -12,11 +12,20 @@ class ModelAMPContinuous(ModelA2CContinuousLogStd):
         net = self.network_builder.build('amp', **config)
         for name, _ in net.named_parameters():
             print(name)
-        return ModelAMPContinuous.Network(net)
+        return ModelAMPContinuous.Network(
+            net,
+            obs_shape=config["input_shape"],
+            # PHC's author AMP player owns checkpoint normalization.  rl-games
+            # 1.6 also offers model-side normalization, which did not exist in
+            # the author version and would normalize each observation twice.
+            normalize_value=False,
+            normalize_input=False,
+            value_size=config.get("value_size", 1),
+        )
 
     class Network(ModelA2CContinuousLogStd.Network):
-        def __init__(self, a2c_network):
-            super().__init__(a2c_network)
+        def __init__(self, a2c_network, **kwargs):
+            super().__init__(a2c_network, **kwargs)
 
             return
 
@@ -105,5 +114,3 @@ class ModelAMPContinuous(ModelA2CContinuousLogStd):
                 dropout_mask[:, dof_joints_offset + idx_joint * 6 : dof_joints_offset + idx_joint * 6 + 6, :] = has_drop_out[:, None]
                 dropout_mask[:, dof_vel_offsets + idx_joint * 3 : dof_vel_offsets + idx_joint * 3 + 3, :] = has_drop_out[:, None]
             return dropout_mask.repeat(1, steps, 1).to(amp_obs)
-
-
