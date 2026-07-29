@@ -56,7 +56,7 @@ import wandb
 
 from learning import im_amp
 from learning import im_amp_players
-from learning import common_agent
+from learning import im_amp_studio_players
 from learning import amp_agent
 from learning import amp_players
 from learning import amp_models
@@ -259,8 +259,7 @@ def build_alg_runner(algo_observer):
     
     runner.algo_factory.register_builder('im_amp', lambda **kwargs: im_amp.IMAmpAgent(**kwargs))
     runner.player_factory.register_builder('im_amp', lambda **kwargs: im_amp_players.IMAMPPlayerContinuous(**kwargs))
-    runner.algo_factory.register_builder('im_task', lambda **kwargs: common_agent.CommonAgent(**kwargs))
-    runner.player_factory.register_builder('im_task', lambda **kwargs: im_amp_players.IMAMPPlayerContinuous(**kwargs))
+    runner.player_factory.register_builder('im_amp_studio', lambda **kwargs: im_amp_studio_players.IMAMPStudioPlayerContinuous(**kwargs))
     
     return runner
 

@@ -30,7 +30,6 @@ from phc.env.tasks.humanoid import Humanoid
 from phc.env.tasks.humanoid_amp import HumanoidAMP
 from phc.env.tasks.humanoid_amp_getup import HumanoidAMPGetup
 from phc.env.tasks.humanoid_im import HumanoidIm
-from phc.env.tasks.humanoid_im_ours_residual import HumanoidImOursResidual
 from phc.env.tasks.humanoid_im_passive_object import HumanoidImPassiveObject
 from phc.env.tasks.humanoid_im_getup import HumanoidImGetup
 from phc.env.tasks.humanoid_im_mcp import HumanoidImMCP

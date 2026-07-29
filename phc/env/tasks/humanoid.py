@@ -625,7 +625,6 @@ class Humanoid(BaseTask):
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
-        plane_params.distance = -float(self.cfg["env"]["plane"].get("height", 0.0))
         plane_params.static_friction = self.plane_static_friction
         plane_params.dynamic_friction = self.plane_dynamic_friction
 
@@ -806,8 +805,7 @@ class Humanoid(BaseTask):
                 "model": self.humanoid_type,
                 "sim": "isaacgym"
             }
-            use_case_shape = bool(self.cfg.robot.get("use_case_shape", False))
-            if use_case_shape:
+            if self._use_case_shape:
                 robot = None
             elif os.path.exists("data/smpl"):
                 robot = SMPL_Robot(
@@ -830,7 +828,7 @@ class Humanoid(BaseTask):
             asset_options.max_angular_velocity = 100.0
             asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
 
-            if use_case_shape:
+            if self._use_case_shape:
                 asset_file_real = os.path.join(asset_root, asset_file)
                 if not os.path.isfile(asset_file_real):
                     raise FileNotFoundError(f"Missing case humanoid asset: {asset_file_real}")
@@ -838,11 +836,13 @@ class Humanoid(BaseTask):
                 humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
                 actuator_props = self.gym.get_asset_actuator_properties(humanoid_asset)
                 motor_efforts = [prop.motor_effort for prop in actuator_props]
-
                 if self.self_obs_v == 3:
                     self.create_humanoid_force_sensors(humanoid_asset, self.force_sensor_joints)
-
-                self.humanoid_shapes = torch.zeros((num_envs, 17), dtype=torch.float32, device=self.device)
+                self.humanoid_shapes = torch.zeros(
+                    (num_envs, 17),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
                 self.humanoid_assets = [humanoid_asset] * num_envs
                 self.skeleton_trees = [sk_tree] * num_envs
             elif self.has_shape_variation:

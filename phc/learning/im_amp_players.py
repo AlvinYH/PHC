@@ -26,21 +26,12 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
     def __init__(self, config):
         super().__init__(config)
 
-        # Evaluation termination comes from the task tensors.  The task may use
-        # a CPU tensor pipeline while the policy remains on ``rl_device`` CUDA,
-        # so keep this accumulator on the task device.
-        self.terminate_state = torch.zeros(
-            self.env.task.num_envs, device=self.env.task.device
-        )
+        self.terminate_state = torch.zeros(self.env.task.num_envs, device=self.device)
         self.terminate_memory = []
 
         self.mpjpe, self.mpjpe_all = [], []
         self.gt_pos, self.gt_pos_all = [], []
         self.pred_pos, self.pred_pos_all = [], []
-        self.tracked_root_states, self.tracked_root_states_all = [], []
-        self.tracked_dof_pos, self.tracked_dof_pos_all = [], []
-        self.tracked_body_rot, self.tracked_body_rot_all = [], []
-        self.physics_rollout, self.physics_rollout_all = [], []
         self.curr_stpes = 0
 
         if COLLECT_Z:
@@ -73,32 +64,6 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
         # joblib.dump({"mlp": self.model.a2c_network.actor_mlp, "mu": self.model.a2c_network.mu}, "single_model.pkl") # ZL: for saving part of the model.
         return
 
-    @staticmethod
-    def _stack_frame_values(frame_values):
-        return np.stack([np.asarray(value) for value in frame_values])
-
-    @classmethod
-    def _stack_rollout_frames(cls, frames):
-        first = frames[0]
-        if isinstance(first, dict):
-            keys = tuple(first)
-            if any(not isinstance(frame, dict) or tuple(frame) != keys for frame in frames):
-                raise ValueError("physics_rollout schema changed within one rollout")
-            return {
-                key: cls._stack_rollout_frames([frame[key] for frame in frames])
-                for key in keys
-            }
-        return cls._stack_frame_values(frames)
-
-    @classmethod
-    def _motion_rollout(cls, rollout, steps, env_index):
-        if isinstance(rollout, dict):
-            return {
-                key: cls._motion_rollout(value, steps, env_index)
-                for key, value in rollout.items()
-            }
-        return rollout[:steps, env_index]
-
     def _post_step(self, info, done):
         super()._post_step(info)
         
@@ -107,9 +72,8 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
         if flags.im_eval:
 
             humanoid_env = self.env.task
-            motion_steps = humanoid_env._motion_lib.get_motion_num_steps()
             
-            termination_state = torch.logical_and(self.curr_stpes <= motion_steps - 1, info["terminate"]) # if terminate after the last frame, then it is not a termination. curr_step is one step behind simulation.
+            termination_state = torch.logical_and(self.curr_stpes <= humanoid_env._motion_lib.get_motion_num_steps() - 1, info["terminate"]) # if terminate after the last frame, then it is not a termination. curr_step is one step behind simulation. 
             # termination_state = info["terminate"]
             self.terminate_state = torch.logical_or(termination_state, self.terminate_state)
             if (~self.terminate_state).sum() > 0:
@@ -118,15 +82,15 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
                 if (max_possible_id == curr_ids).sum() > 0: # When you are running out of motions. 
                     bound = (max_possible_id == curr_ids).nonzero()[0] + 1
                     if (~self.terminate_state[:bound]).sum() > 0:
-                        curr_max = motion_steps[:bound][~self.terminate_state[:bound]].max()
+                        curr_max = humanoid_env._motion_lib.get_motion_num_steps()[:bound][~self.terminate_state[:bound]].max()
                     else:
                         curr_max = (self.curr_stpes - 1)  # the ones that should be counted have teimrated
                 else:
-                    curr_max = motion_steps[~self.terminate_state].max()
+                    curr_max = humanoid_env._motion_lib.get_motion_num_steps()[~self.terminate_state].max()
 
                 if self.curr_stpes >= curr_max: curr_max = self.curr_stpes + 1  # For matching up the current steps and max steps. 
             else:
-                curr_max = motion_steps.max()
+                curr_max = humanoid_env._motion_lib.get_motion_num_steps().max()
 
             if humanoid_env.collect_dataset:
                 self.obs_buf.append(info['obs_buf'])
@@ -137,89 +101,49 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
             self.mpjpe.append(info["mpjpe"])
             self.gt_pos.append(info["body_pos_gt"])
             self.pred_pos.append(info["body_pos"])
-            self.tracked_root_states.append(
-                humanoid_env._humanoid_root_states.detach().cpu().numpy().astype(np.float32)
-            )
-            self.tracked_dof_pos.append(
-                humanoid_env._dof_pos.detach().cpu().numpy().astype(np.float32)
-            )
-            self.tracked_body_rot.append(
-                humanoid_env._rigid_body_rot.detach().cpu().numpy().astype(np.float32)
-            )
-            if "physics_rollout" in info:
-                self.physics_rollout.append(info["physics_rollout"])
             if COLLECT_Z: self.zs.append(info["z"])
             self.curr_stpes += 1
 
-            if self.curr_stpes >= curr_max - 1 or self.terminate_state.sum() == humanoid_env.num_envs:
+            if self.curr_stpes >= curr_max or self.terminate_state.sum() == humanoid_env.num_envs:
                 
                 self.terminate_memory.append(self.terminate_state.cpu().numpy())
                 self.success_rate = (1 - np.concatenate(self.terminate_memory)[: humanoid_env._motion_lib._num_unique_motions].mean())
 
                 # MPJPE
                 all_mpjpe = torch.stack(self.mpjpe)
-                expected_last_step = curr_max - 1
-                if not (
-                    all_mpjpe.shape[0] in (curr_max, expected_last_step)
-                    or self.terminate_state.sum() == humanoid_env.num_envs
-                ):
-                    print(
-                        "Warning: eval frame count mismatch",
-                        all_mpjpe.shape[0],
-                        curr_max,
-                    )
+                try:
+                    assert(all_mpjpe.shape[0] == curr_max or self.terminate_state.sum() == humanoid_env.num_envs) # Max should be the same as the number of frames in the motion.
+                except:
+                    import ipdb; ipdb.set_trace()
+                    print('??')
 
-                all_mpjpe = [all_mpjpe[: (i - 1), idx].mean() for idx, i in enumerate(motion_steps)] # -1 since we do not count the first frame.
+                all_mpjpe = [all_mpjpe[: (i - 1), idx].mean() for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())] # -1 since we do not count the first frame. 
                 all_body_pos_pred = np.stack(self.pred_pos)
-                all_body_pos_pred = [all_body_pos_pred[: (i - 1), idx] for idx, i in enumerate(motion_steps)]
+                all_body_pos_pred = [all_body_pos_pred[: (i - 1), idx] for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())]
                 all_body_pos_gt = np.stack(self.gt_pos)
-                all_body_pos_gt = [all_body_pos_gt[: (i - 1), idx] for idx, i in enumerate(motion_steps)]
-                all_tracked_root_states = np.stack(self.tracked_root_states)
-                all_tracked_root_states = [
-                    all_tracked_root_states[: (i - 1), idx]
-                    for idx, i in enumerate(motion_steps)
-                ]
-                all_tracked_dof_pos = np.stack(self.tracked_dof_pos)
-                all_tracked_dof_pos = [
-                    all_tracked_dof_pos[: (i - 1), idx]
-                    for idx, i in enumerate(motion_steps)
-                ]
-                all_tracked_body_rot = np.stack(self.tracked_body_rot)
-                all_tracked_body_rot = [
-                    all_tracked_body_rot[: (i - 1), idx]
-                    for idx, i in enumerate(motion_steps)
-                ]
-                self.tracked_root_states_all += all_tracked_root_states
-                self.tracked_dof_pos_all += all_tracked_dof_pos
-                self.tracked_body_rot_all += all_tracked_body_rot
-                if self.physics_rollout:
-                    rollout = self._stack_rollout_frames(self.physics_rollout)
-                    self.physics_rollout_all.extend(
-                        self._motion_rollout(rollout, int(steps) - 1, env_index)
-                        for env_index, steps in enumerate(motion_steps)
-                    )
+                all_body_pos_gt = [all_body_pos_gt[: (i - 1), idx] for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())]
 
                 if COLLECT_Z:
                     all_zs = torch.stack(self.zs)
-                    all_zs = [all_zs[: (i - 1), idx] for idx, i in enumerate(motion_steps)]
+                    all_zs = [all_zs[: (i - 1), idx] for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())]
                     self.zs_all += all_zs
 
 
                 if humanoid_env.collect_dataset:
                     all_obs_buf = np.stack(self.obs_buf) # Time, batch, obs
-                    all_obs_buf = [all_obs_buf[: (i - 1), idx] for idx, i in enumerate(motion_steps)]
+                    all_obs_buf = [all_obs_buf[: (i - 1), idx] for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())]
                     self.obs_buf_all += all_obs_buf
 
                     all_clean_actions = np.stack(self.clean_actions) 
-                    all_clean_actions = [all_clean_actions[: (i - 1), idx] for idx, i in enumerate(motion_steps)]
+                    all_clean_actions = [all_clean_actions[: (i - 1), idx] for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())]
                     self.clean_actions_all += all_clean_actions
                     
                     all_actions = np.stack(self.env_actions)
-                    all_actions = [all_actions[: (i - 1), idx] for idx, i in enumerate(motion_steps)]
+                    all_actions = [all_actions[: (i - 1), idx] for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())]
                     self.actions_all += all_actions
 
                     all_reset_buf = np.stack(self.reset_buf)
-                    all_reset_buf = [all_reset_buf[: (i - 1), idx] for idx, i in enumerate(motion_steps)]
+                    all_reset_buf = [all_reset_buf[: (i - 1), idx] for idx, i in enumerate(humanoid_env._motion_lib.get_motion_num_steps())]
                     self.reset_buf_all += all_reset_buf
                     
                     self.keys_all += humanoid_env._motion_lib.curr_motion_keys.tolist()
@@ -268,80 +192,6 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
                     print("Succ: "," \t".join([f"{k}: {v:.3f}" for k, v in metrics_print.items()]))
                     # print(1 - self.terminate_state.sum() / self.terminate_state.shape[0])
                     print(self.config['network_path'])
-                    eval_summary = {
-                        "success_rate": float(self.success_rate),
-                        "metrics_all": {k: float(v) for k, v in metrics_all_print.items()},
-                        "metrics_success": {k: float(v) for k, v in metrics_print.items()},
-                        "failed_keys": failed_keys.tolist(),
-                        "success_keys": success_keys.tolist(),
-                        "num_motions": int(humanoid_env._motion_lib._num_unique_motions),
-                    }
-                    rollout_records = self.physics_rollout_all[
-                        : humanoid_env._motion_lib._num_unique_motions
-                    ]
-                    rollout_keys = [
-                        str(key)
-                        for key in humanoid_env._motion_lib._motion_data_keys[
-                            : len(rollout_records)
-                        ]
-                    ]
-                    eval_summary["physics_rollout"] = {
-                        key: record
-                        for key, record in zip(rollout_keys, rollout_records)
-                    }
-                    eval_summary["physics_rollout_metadata"] = {
-                        "object": {
-                            "joint_names": list(
-                                getattr(humanoid_env, "_target_joint_names", [])
-                            ),
-                        },
-                        "contact": {
-                            "target_body_names": list(
-                                getattr(humanoid_env, "_target_body_names", [])
-                            ),
-                            "human_body_names": list(
-                                getattr(humanoid_env, "_body_names", [])
-                            ),
-                            "label_names": list(
-                                getattr(humanoid_env, "_phc_contact_label_names_10", [])
-                            ),
-                            "granularity": str(
-                                getattr(humanoid_env, "_phc_contact_granularity", "none")
-                            ),
-                            "source": "surface_distance_and_net_contact_force",
-                        },
-                    }
-                    tracked_root_states_all = self.tracked_root_states_all[: humanoid_env._motion_lib._num_unique_motions]
-                    tracked_dof_pos_all = self.tracked_dof_pos_all[: humanoid_env._motion_lib._num_unique_motions]
-                    tracked_body_rot_all = self.tracked_body_rot_all[: humanoid_env._motion_lib._num_unique_motions]
-                    tracked_keys = [
-                        str(k)
-                        for k in humanoid_env._motion_lib._motion_data_keys[: len(tracked_root_states_all)]
-                    ]
-                    eval_summary["tracked_root_states"] = {
-                        k: v for k, v in zip(tracked_keys, tracked_root_states_all)
-                    }
-                    eval_summary["tracked_dof_pos"] = {
-                        k: v for k, v in zip(tracked_keys, tracked_dof_pos_all)
-                    }
-                    eval_summary["tracked_body_rot"] = {
-                        k: v for k, v in zip(tracked_keys, tracked_body_rot_all)
-                    }
-                    eval_summary["tracked_body_pos"] = {
-                        k: v
-                        for k, v in zip(
-                            tracked_keys,
-                            self.pred_pos_all[: humanoid_env._motion_lib._num_unique_motions],
-                        )
-                    }
-                    eval_summary["tracked_body_pos_gt"] = {
-                        k: v
-                        for k, v in zip(
-                            tracked_keys,
-                            self.gt_pos_all[: humanoid_env._motion_lib._num_unique_motions],
-                        )
-                    }
-                    joblib.dump(eval_summary, osp.join(self.config['network_path'], "phc_eval_summary.pkl"))
                     if COLLECT_Z:
                         zs_all = self.zs_all[:humanoid_env._motion_lib._num_unique_motions]
                         zs_dump = {k: zs_all[idx].cpu().numpy() for idx, k in enumerate(humanoid_env._motion_lib._motion_data_keys)}
@@ -361,11 +211,10 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
                                 "reset": np.concatenate(self.reset_buf_all), 
                                 "running_mean": self.running_mean_std.state_dict(),
                                 "config": humanoid_env.cfg,
-                        }, dump_dir, compress=True)
+                                }, dump_dir, compress=True)
                         exit()
 
-                    if not os.environ.get("PHC_EVAL_NO_IPDB"):
-                        import ipdb; ipdb.set_trace()
+                    import ipdb; ipdb.set_trace()
 
                     joblib.dump(failed_keys, osp.join(self.config['network_path'], "failed.pkl"))
                     joblib.dump(success_keys, osp.join(self.config['network_path'], "long_succ.pkl"))
@@ -375,14 +224,12 @@ class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
 
                 humanoid_env.forward_motion_samples()
                 self.terminate_state = torch.zeros(
-                    self.env.task.num_envs, device=self.env.task.device
+                    self.env.task.num_envs, device=self.device
                 )
 
                 self.pbar.update(1)
                 self.pbar.refresh()
                 self.mpjpe, self.gt_pos, self.pred_pos,  = [], [], []
-                self.tracked_root_states, self.tracked_dof_pos, self.tracked_body_rot = [], [], []
-                self.physics_rollout = []
                 if humanoid_env.collect_dataset: 
                     self.obs_buf, self.env_actions, self.clean_actions, self.reset_buf, self.keys = [], [], [], [], []
                 if COLLECT_Z: self.zs = []

@@ -117,7 +117,7 @@ class HumanoidAMP(Humanoid):
 
         self._amp_obs_demo_buf = None
 
-        data_dir = cfg["robot"]["smpl_data_root"]
+        data_dir = cfg["robot"].get("smpl_data_root", "data/smpl")
         
         if self.humanoid_type in ["smpl", ]:
             self.smpl_parser_n = SMPL_Parser(model_path=data_dir, gender="neutral").to(self.device)

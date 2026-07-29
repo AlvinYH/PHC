@@ -28,7 +28,7 @@ print("MOVING MOTION DATA TO GPU, USING CACHE:", USE_CACHE)
 
 if not USE_CACHE:
     old_numpy = torch.Tensor.numpy
-    
+
     class Patch:
 
         def numpy(self):
@@ -47,7 +47,7 @@ class MotionLibSMPL(MotionLibBase):
     def __init__(self, motion_lib_cfg):
         super().__init__(motion_lib_cfg = motion_lib_cfg)
         
-        data_dir = motion_lib_cfg.smpl_data_root
+        data_dir = motion_lib_cfg.get("smpl_data_root", "data/smpl")
         
         if osp.exists(data_dir):
             if motion_lib_cfg.smpl_type == "smpl":
@@ -68,7 +68,7 @@ class MotionLibSMPL(MotionLibBase):
             self.mesh_parsers = None
         
         return
-    
+
     @staticmethod
     def fix_trans_height(pose_aa, trans, curr_gender_betas, mesh_parsers, fix_height_mode):
         if fix_height_mode == FixHeightMode.no_fix:
@@ -178,4 +178,6 @@ class MotionLibSMPL(MotionLibBase):
             queue.put(res)
         else:
             return res
+
+
 
