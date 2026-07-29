@@ -24,7 +24,7 @@ autograd
 scikit-learn
 git+https://github.com/mattloper/chumpy
 patchelf
-rl-games==1.1.4
+rl-games==1.6.1
 wandb
 pyvirtualdisplay
 chumpy

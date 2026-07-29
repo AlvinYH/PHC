@@ -67,6 +67,19 @@ class HumanoidImPassiveObject(HumanoidIm):
             self._phc_contact_region_points_local_np,
             self._phc_contact_region_point_body_names,
         ) = self._load_contact_region_points(object_config)
+        self._phc_contact_region_names = tuple(
+            str(name) for name in object_config["contact_region_body_names"]
+        )
+        if (
+            not self._phc_contact_region_names
+            or len(set(self._phc_contact_region_names))
+            != len(self._phc_contact_region_names)
+            or set(self._phc_contact_region_names)
+            != set(self._phc_contact_region_point_body_names)
+        ):
+            raise ValueError(
+                "contact_region_body_names must exactly cover the point-link names"
+            )
 
         # This field is a diagnostic runtime control, not case data.
         self._phc_eval_start_frame = (
@@ -118,6 +131,7 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._phc_contact_region_body_local_ids = None
         self._phc_contact_region_points_local = None
         self._phc_contact_region_point_body_local_ids = None
+        self._phc_contact_region_point_indices = None
         self._phc_contact_hand_body_ids = None
         self._phc_contact_label_capsule_endpoints_local = None
         self._phc_contact_label_capsule_radii = None
@@ -282,7 +296,7 @@ class HumanoidImPassiveObject(HumanoidIm):
         )
 
     def _create_ground_plane(self):
-        from pipeline.physics.isaac_env import add_ground_plane, load_static_box_assets
+        from pipeline.physics.articulated_scene import add_ground_plane, load_static_box_assets
 
         add_ground_plane(self.gym, self.sim, self._phc_object_config)
 
@@ -300,7 +314,7 @@ class HumanoidImPassiveObject(HumanoidIm):
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):
         super()._build_env(env_id, env_ptr, humanoid_asset)
-        from pipeline.physics.isaac_env import validate_humanoid_object_collision_filters
+        from pipeline.physics.articulated_scene import validate_humanoid_object_collision_filters
 
         validate_humanoid_object_collision_filters(
             self.gym,
@@ -308,7 +322,7 @@ class HumanoidImPassiveObject(HumanoidIm):
             self.humanoid_handles[env_id],
         )
         self._build_target(env_id, env_ptr)
-        from pipeline.physics.isaac_env import (
+        from pipeline.physics.articulated_scene import (
             STATIC_SCENE_COLLISION_FILTER,
             create_static_box_actors,
         )
@@ -325,7 +339,7 @@ class HumanoidImPassiveObject(HumanoidIm):
         )
 
     def _load_target_asset(self):
-        from pipeline.physics.isaac_env import load_articulated_asset
+        from pipeline.physics.articulated_scene import load_articulated_asset
 
         self._target_asset, self._target_dof_properties = load_articulated_asset(
             self.gym,
@@ -348,7 +362,7 @@ class HumanoidImPassiveObject(HumanoidIm):
         default_pose.p = gymapi.Vec3(*[float(v) for v in self._target_default_root_pos_np])
         default_pose.r = gymapi.Quat(*[float(v) for v in self._target_default_root_quat_np])
 
-        from pipeline.physics.isaac_env import (
+        from pipeline.physics.articulated_scene import (
             ARTICULATED_OBJECT_COLLISION_FILTER,
             configure_articulated_actor,
         )
@@ -423,6 +437,20 @@ class HumanoidImPassiveObject(HumanoidIm):
             device=self.device,
         )
         self._phc_contact_region_point_body_local_ids = self._resolve_contact_region_point_body_local_ids()
+        self._phc_contact_region_point_indices = tuple(
+            torch.tensor(
+                [
+                    index
+                    for index, point_name in enumerate(
+                        self._phc_contact_region_point_body_names
+                    )
+                    if point_name == region_name
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+            for region_name in self._phc_contact_region_names
+        )
         hand_ids = sorted(set(self._left_hand_body_ids + self._right_hand_body_ids))
         self._phc_contact_hand_body_ids = torch.tensor(hand_ids, dtype=torch.long, device=self.device)
         self._phc_contact_label_body_ids = self._resolve_contact_label_body_ids()
@@ -438,22 +466,23 @@ class HumanoidImPassiveObject(HumanoidIm):
 
     def _resolve_contact_region_body_local_ids(self):
         names = list(self._target_body_names)
-        # The exported point/link assignments are authoritative. Using broader
-        # source link lists can select a stationary second door in multi-door
-        # objects and incorrectly count it as the manipulated region.
-        requested_names = sorted(set(self._phc_contact_region_point_body_names))
         selected = []
-        for requested in requested_names:
-            for idx, body_name in enumerate(names):
-                text = str(body_name)
-                if text == requested or text.endswith(requested):
-                    selected.append(idx)
-        if not selected:
-            raise RuntimeError(
-                "No contact-region point link resolved to an Isaac object body: "
-                f"point_links={requested_names}, target_body_names={names}"
-            )
-        selected = sorted(set(int(idx) for idx in selected))
+        for requested in self._phc_contact_region_names:
+            exact = [
+                index for index, body_name in enumerate(names)
+                if str(body_name) == requested
+            ]
+            suffix = [
+                index for index, body_name in enumerate(names)
+                if str(body_name).endswith(requested)
+            ]
+            matches = exact or suffix
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Contact-region link {requested!r} resolved "
+                    f"{len(matches)} Isaac bodies: {names}"
+                )
+            selected.append(matches[0])
         return torch.tensor(selected, dtype=torch.long, device=self.device)
 
     def _resolve_contact_region_point_body_local_ids(self):
@@ -688,7 +717,11 @@ class HumanoidImPassiveObject(HumanoidIm):
                 self._target_states
             )
             self._phc_reset_hand_region_distance = torch.zeros(
-                (self.num_envs, 2),
+                (
+                    self.num_envs,
+                    2,
+                    len(self._phc_contact_region_names),
+                ),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -773,7 +806,10 @@ class HumanoidImPassiveObject(HumanoidIm):
 
     def _target_contact_region_force_norm(self):
         local_ids = self._phc_contact_region_body_local_ids
-        return torch.linalg.norm(self._target_contact_forces[:, local_ids, :], dim=-1).max(dim=-1).values
+        return torch.linalg.norm(
+            self._target_contact_forces[:, local_ids, :],
+            dim=-1,
+        )
 
     def _contact_ref_for_frames(self, frame_indices):
         n = int(frame_indices.shape[0])
@@ -793,13 +829,19 @@ class HumanoidImPassiveObject(HumanoidIm):
         region_pos = self._target_contact_region_positions()
         label_body_ids = self._phc_contact_label_body_ids
         body_state = self._rigid_body_state_reshaped[:, label_body_ids, :]
-        return capsule_region_surface_distances(
-            body_pos=body_state[..., 0:3],
-            body_quat_xyzw=body_state[..., 3:7],
-            endpoints_local=self._phc_contact_label_capsule_endpoints_local,
-            radii=self._phc_contact_label_capsule_radii,
-            valid=self._phc_contact_label_capsule_valid,
-            region_points=region_pos,
+        return torch.stack(
+            [
+                capsule_region_surface_distances(
+                    body_pos=body_state[..., 0:3],
+                    body_quat_xyzw=body_state[..., 3:7],
+                    endpoints_local=self._phc_contact_label_capsule_endpoints_local,
+                    radii=self._phc_contact_label_capsule_radii,
+                    valid=self._phc_contact_label_capsule_valid,
+                    region_points=region_pos[:, point_indices],
+                )
+                for point_indices in self._phc_contact_region_point_indices
+            ],
+            dim=-1,
         )
 
     def _contact_label_force_norm(self):
@@ -814,31 +856,36 @@ class HumanoidImPassiveObject(HumanoidIm):
 
         region_pos = self._target_contact_region_positions()
         body_state = self._rigid_body_state_reshaped[:, self._phc_hand_body_ids_flat, :]
-        capsule_distance = capsule_region_surface_distances(
-            body_pos=body_state[..., 0:3],
-            body_quat_xyzw=body_state[..., 3:7],
-            endpoints_local=self._phc_hand_capsule_endpoints_local,
-            radii=self._phc_hand_capsule_radii,
-            valid=self._phc_hand_capsule_valid,
-            region_points=region_pos,
-        )
-        box_distance = box_region_surface_distances(
-            body_pos=body_state[..., 0:3],
-            body_quat_xyzw=body_state[..., 3:7],
-            centers_local=self._phc_hand_box_centers_local,
-            quaternions_local_xyzw=self._phc_hand_box_quaternions_local,
-            half_extents=self._phc_hand_box_half_extents,
-            valid=self._phc_hand_box_valid,
-            region_points=region_pos,
-        )
-        body_distance = torch.minimum(capsule_distance, box_distance)
-        return torch.stack(
-            [
-                body_distance[:, group].min(dim=1).values
-                for group in self._phc_hand_group_slices
-            ],
-            dim=1,
-        )
+        distance_by_region = []
+        for point_indices in self._phc_contact_region_point_indices:
+            capsule_distance = capsule_region_surface_distances(
+                body_pos=body_state[..., 0:3],
+                body_quat_xyzw=body_state[..., 3:7],
+                endpoints_local=self._phc_hand_capsule_endpoints_local,
+                radii=self._phc_hand_capsule_radii,
+                valid=self._phc_hand_capsule_valid,
+                region_points=region_pos[:, point_indices],
+            )
+            box_distance = box_region_surface_distances(
+                body_pos=body_state[..., 0:3],
+                body_quat_xyzw=body_state[..., 3:7],
+                centers_local=self._phc_hand_box_centers_local,
+                quaternions_local_xyzw=self._phc_hand_box_quaternions_local,
+                half_extents=self._phc_hand_box_half_extents,
+                valid=self._phc_hand_box_valid,
+                region_points=region_pos[:, point_indices],
+            )
+            body_distance = torch.minimum(capsule_distance, box_distance)
+            distance_by_region.append(
+                torch.stack(
+                    [
+                        body_distance[:, group].min(dim=1).values
+                        for group in self._phc_hand_group_slices
+                    ],
+                    dim=1,
+                )
+            )
+        return torch.stack(distance_by_region, dim=-1)
 
     def _physics_step(self):
         if self.control_mode != "pd":
