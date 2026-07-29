@@ -23,8 +23,8 @@ import copy
 COLLECT_Z = False
 
 class IMAMPPlayerContinuous(amp_players.AMPPlayerContinuous):
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, params):
+        super().__init__(params)
 
         self.terminate_state = torch.zeros(self.env.task.num_envs, device=self.device)
         self.terminate_memory = []

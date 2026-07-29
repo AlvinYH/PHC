@@ -15,12 +15,13 @@ def rescale_actions(low, high, action):
     return scaled_action
 
 class AMPPlayerContinuous(common_player.CommonPlayer):
-    def __init__(self, config):
+    def __init__(self, params):
+        config = params['config']
         self._normalize_amp_input = config.get('normalize_amp_input', True)
         self._normalize_input = config['normalize_input']
         self._disc_reward_scale = config['disc_reward_scale']
 
-        super().__init__(config)
+        super().__init__(params)
 
         # self.env.task.update_value_func(self._eval_critic, self._eval_actor)
         # import copy
@@ -165,12 +166,13 @@ class AMPPlayerContinuous(common_player.CommonPlayer):
 
 
 class AMPPlayerDiscrete(common_player.CommonPlayerDiscrete):
-    def __init__(self, config):
+    def __init__(self, params):
+        config = params['config']
         self._normalize_amp_input = config.get('normalize_amp_input', True)
         self._normalize_input = config['normalize_input']
         self._disc_reward_scale = config['disc_reward_scale']
 
-        super().__init__(config)
+        super().__init__(params)
 
         # self.env.task.update_value_func(self._eval_critic, self._eval_actor)
         # import copy

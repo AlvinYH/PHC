@@ -59,8 +59,8 @@ def _select_environment(values, env_index: int):
 class IMAMPStudioPlayerContinuous(IMAMPPlayerContinuous):
     """Add common-adapter telemetry without replacing PHC-X policy execution."""
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, params):
+        super().__init__(params)
         self._studio_frames = []
         self._studio_written = False
 

@@ -37,8 +37,7 @@ sys.path.append(os.getcwd())
 from phc.utils.config import set_np_formatting, set_seed, get_args, parse_sim_params, load_cfg
 from phc.utils.parse_task import parse_task
 
-from rl_games.algos_torch import players
-from rl_games.algos_torch import torch_ext
+from rl_games.algos_torch import model_builder, players, torch_ext
 from rl_games.common import env_configurations, experiment, vecenv
 from rl_games.common.algo_observer import AlgoObserver
 from rl_games.torch_runner import Runner
@@ -200,10 +199,10 @@ def build_alg_runner(algo_observer):
     runner.algo_factory.register_builder('amp', lambda **kwargs: amp_agent.AMPAgent(**kwargs))
     runner.player_factory.register_builder('amp', lambda **kwargs: amp_players.AMPPlayerContinuous(**kwargs))
 
-    runner.model_builder.model_factory.register_builder('amp', lambda network, **kwargs: amp_models.ModelAMPContinuous(network))
-    runner.model_builder.network_factory.register_builder('amp', lambda **kwargs: amp_network_builder.AMPBuilder())
-    runner.model_builder.network_factory.register_builder('amp_mcp', lambda **kwargs: amp_network_mcp_builder.AMPMCPBuilder())
-    runner.model_builder.network_factory.register_builder('amp_pnn', lambda **kwargs: amp_network_pnn_builder.AMPPNNBuilder())
+    model_builder.register_model('amp', amp_models.ModelAMPContinuous)
+    model_builder.register_network('amp', amp_network_builder.AMPBuilder)
+    model_builder.register_network('amp_mcp', amp_network_mcp_builder.AMPMCPBuilder)
+    model_builder.register_network('amp_pnn', amp_network_pnn_builder.AMPPNNBuilder)
     
     runner.algo_factory.register_builder('im_amp', lambda **kwargs: im_amp.IMAmpAgent(**kwargs))
     runner.player_factory.register_builder('im_amp', lambda **kwargs: im_amp_players.IMAMPPlayerContinuous(**kwargs))
