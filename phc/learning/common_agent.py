@@ -33,6 +33,9 @@ import wandb
 
 class CommonAgent(a2c_continuous.A2CAgent):
 
+    def _build_running_mean_std(self, obs_shape):
+        return RunningMeanStd(obs_shape).to(self.ppo_device)
+
     def __init__(self, base_name, config):
         a2c_common.A2CBase.__init__(self, base_name, config)
         self.cfg = config
@@ -54,7 +57,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
                 obs_shape = torch_ext.shape_whc_to_cwh(self.vec_env.env.task.get_running_mean_size())
             else:
                 obs_shape = self.obs_shape
-            self.running_mean_std = RunningMeanStd(obs_shape).to(self.ppo_device)
+            self.running_mean_std = self._build_running_mean_std(obs_shape)
             
         net_config['mean_std'] = self.running_mean_std
         self.model = self.network.build(net_config)

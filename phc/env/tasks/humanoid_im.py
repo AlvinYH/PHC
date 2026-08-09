@@ -333,7 +333,9 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
                     "smpl_data_root",
                     "data/smpl",
                 ),
-                "randomrize_heading": True,
+                "randomrize_heading": bool(
+                    self.cfg["env"].get("randomize_heading", True)
+                ),
                 "device": self.device,
                 "step_dt": self.dt,
             })
@@ -356,7 +358,9 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
                 "im_eval": flags.im_eval,
                 "multi_thread": not self.cfg.disable_multiprocessing ,
                 "smpl_type": self.humanoid_type,
-                "randomrize_heading": True,
+                "randomrize_heading": bool(
+                    self.cfg["env"].get("randomize_heading", True)
+                ),
                 "device": self.device,
                 "robot": self.cfg.robot,
                 "step_dt": self.dt,

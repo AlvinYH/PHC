@@ -47,6 +47,15 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._target_default_root_quat_np = np.asarray(
             object_config["target_default_root_quat_xyzw"], dtype=np.float32
         )
+        self._target_initial_body_names = [
+            str(name) for name in object_config["initial_body_names"]
+        ]
+        self._target_initial_body_pos_np = np.asarray(
+            object_config["initial_body_pos"], dtype=np.float32
+        )
+        self._target_initial_body_quat_np = np.asarray(
+            object_config["initial_body_quat_xyzw"], dtype=np.float32
+        )
         self._target_qpos_fps = float(object_config["fps"])
         self._target_joint_names = list(object_config["articulated_target_joint_names"])
         if self._target_default_root_pos_np.shape != (3,):
@@ -59,6 +68,14 @@ class HumanoidImPassiveObject(HumanoidIm):
                 "target_default_root_quat_xyzw must have shape (4,), got "
                 f"{self._target_default_root_quat_np.shape}"
             )
+        body_count = len(self._target_initial_body_names)
+        if (
+            self._target_initial_body_pos_np.shape != (body_count, 3)
+            or self._target_initial_body_quat_np.shape != (body_count, 4)
+            or not np.isfinite(self._target_initial_body_pos_np).all()
+            or not np.isfinite(self._target_initial_body_quat_np).all()
+        ):
+            raise ValueError("initial object body FK must be finite [B,3]/[B,4]")
         if self._target_qpos_fps <= 0.0:
             raise ValueError(f"Object reference fps must be positive, got {self._target_qpos_fps}")
         if not self._target_joint_names:
@@ -114,6 +131,7 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._left_hand_body_ids = []
         self._right_hand_body_ids = []
         self._phc_contact_labels_10 = None
+        self._phc_contact_labels_hand2 = None
         self._phc_contact_obj_ref = None
         self._phc_contact_label_names_10 = [
             "left_thumb",
@@ -296,6 +314,9 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._phc_contact_labels_10 = torch.tensor(
             labels, dtype=torch.float32, device=self.device
         )
+        self._phc_contact_labels_hand2 = torch.tensor(
+            labels_hand2, dtype=torch.float32, device=self.device
+        )
         self._phc_contact_obj_ref = torch.tensor(
             contact_obj, dtype=torch.float32, device=self.device
         )
@@ -315,6 +336,20 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._target_handles = []
         self._target_static_box_handles = []
         self._load_target_asset()
+        # Humanoid's existing aggregate default reserves 160 slots.  This is
+        # enough for its own asset, but a Studio canonical object may contain
+        # hundreds of collision submeshes (for example the PartNet washing
+        # machine).  Isaac Gym corrupts native memory rather than reporting a
+        # capacity error when that aggregate is undersized.  Reserve the
+        # existing humanoid budget plus the actual Studio object asset count
+        # before Humanoid starts the aggregate for each environment.
+        env_cfg = self.cfg["env"]
+        base_bodies = int(env_cfg.get("aggregateBodies", 160))
+        base_shapes = int(env_cfg.get("aggregateShapes", 160))
+        target_bodies = int(self.gym.get_asset_rigid_body_count(self._target_asset))
+        target_shapes = int(self.gym.get_asset_rigid_shape_count(self._target_asset))
+        env_cfg["aggregateBodies"] = max(base_bodies, base_bodies + target_bodies)
+        env_cfg["aggregateShapes"] = max(base_shapes, base_shapes + target_shapes)
         super()._create_envs(num_envs, spacing, num_per_row)
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):
@@ -364,13 +399,37 @@ class HumanoidImPassiveObject(HumanoidIm):
             raise RuntimeError("Target asset must be loaded before building envs")
 
         default_pose = gymapi.Transform()
-        default_pose.p = gymapi.Vec3(*[float(v) for v in self._target_default_root_pos_np])
-        default_pose.r = gymapi.Quat(*[float(v) for v in self._target_default_root_quat_np])
+        create_at_identity = self.cfg["env"].get(
+            "oursDiagnosticObjectActorCreationIdentity", False
+        )
+        if create_at_identity and not (
+            getattr(self, "_ours_batch_replay", False)
+            or getattr(self, "_ours_closed_loop_trace_path", None)
+        ):
+            raise ValueError("object actor creation-pose override is audit-only")
+        if not create_at_identity:
+            default_pose.p = gymapi.Vec3(
+                *[float(v) for v in self._target_default_root_pos_np]
+            )
+            default_pose.r = gymapi.Quat(
+                *[float(v) for v in self._target_default_root_quat_np]
+            )
 
         from pipeline.physics.articulated_scene import (
             ARTICULATED_OBJECT_COLLISION_FILTER,
             configure_articulated_actor,
         )
+        collision_filter = ARTICULATED_OBJECT_COLLISION_FILTER
+        diagnostic_filter = self.cfg["env"].get(
+            "oursDiagnosticObjectCollisionFilter"
+        )
+        if diagnostic_filter is not None:
+            if not (
+                getattr(self, "_ours_batch_replay", False)
+                or getattr(self, "_ours_closed_loop_trace_path", None)
+            ):
+                raise ValueError("object collision-filter override is audit-only")
+            collision_filter = int(diagnostic_filter)
 
         target_handle = self.gym.create_actor(
             env_ptr,
@@ -378,7 +437,7 @@ class HumanoidImPassiveObject(HumanoidIm):
             default_pose,
             self._target_name,
             env_id,
-            ARTICULATED_OBJECT_COLLISION_FILTER,
+            collision_filter,
             0,
         )
         configure_articulated_actor(
@@ -396,16 +455,41 @@ class HumanoidImPassiveObject(HumanoidIm):
     def _build_target_tensors(self):
         num_actors = self.get_num_actors_per_env()
         root_view = self._root_states.view(self.num_envs, num_actors, self._root_states.shape[-1])
-        handles_long = torch.tensor(self._target_handles, dtype=torch.long, device=self.device)
-        env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
-        self._target_states = root_view[env_ids, handles_long, :]
-        self._tar_actor_ids = self._humanoid_actor_ids + handles_long.to(torch.int32)
+        if not self._target_handles or len(set(self._target_handles)) != 1:
+            raise RuntimeError("The articulated object must use one actor slot in every environment")
+        target_handle = int(self._target_handles[0])
+        # Keep this as basic indexing.  Pairwise advanced indexing returns a
+        # copy, so object resets would never reach the root tensor given to
+        # Isaac Gym's indexed setter.
+        self._target_states = root_view[:, target_handle, :]
+        self._tar_actor_ids = self._humanoid_actor_ids + target_handle
 
         self._target_default_root_pos = torch.tensor(
             self._target_default_root_pos_np, dtype=torch.float32, device=self.device
         )
         self._target_default_root_quat = torch.tensor(
             self._target_default_root_quat_np, dtype=torch.float32, device=self.device
+        )
+        if (
+            len(set(self._target_initial_body_names)) != len(self._target_initial_body_names)
+            or set(self._target_initial_body_names) != set(self._target_body_names)
+        ):
+            raise RuntimeError(
+                "Materialized reset FK bodies differ from the Isaac object asset: "
+                f"materialized={self._target_initial_body_names}, "
+                f"isaac={self._target_body_names}"
+            )
+        source_index = {
+            name: index for index, name in enumerate(self._target_initial_body_names)
+        }
+        isaac_order = [source_index[name] for name in self._target_body_names]
+        self._target_initial_body_pos_np = self._target_initial_body_pos_np[isaac_order]
+        self._target_initial_body_quat_np = self._target_initial_body_quat_np[isaac_order]
+        self._target_initial_body_pos = torch.tensor(
+            self._target_initial_body_pos_np, dtype=torch.float32, device=self.device
+        )
+        self._target_initial_body_quat = torch.tensor(
+            self._target_initial_body_quat_np, dtype=torch.float32, device=self.device
         )
 
         self._target_max_dof = int(self._target_asset_dof_count)
@@ -699,11 +783,18 @@ class HumanoidImPassiveObject(HumanoidIm):
 
     def _reset_envs(self, env_ids):
         super()._reset_envs(env_ids)
-        if (
-            not flags.im_eval
-            or len(env_ids) == 0
-            or self._target_dof_pos is None
-        ):
+        if len(env_ids) == 0 or self._target_dof_pos is None:
+            return
+
+        target_bodies = self._rigid_body_state_reshaped[
+            :, self.num_bodies : self.num_bodies + self._target_asset_body_count
+        ]
+        target_bodies[env_ids, :, 0:3] = self._target_initial_body_pos
+        target_bodies[env_ids, :, 3:7] = self._target_initial_body_quat
+        target_bodies[env_ids, :, 7:13] = 0.0
+        self._compute_observations(env_ids)
+
+        if not flags.im_eval:
             return
 
         human_body_state = self._rigid_body_state.view(
@@ -729,9 +820,13 @@ class HumanoidImPassiveObject(HumanoidIm):
                 dtype=torch.float32,
                 device=self.device,
             )
-        self._phc_reset_human_root_state[env_ids] = self._humanoid_root_states[
-            env_ids
-        ]
+        # The common Studio rollout contract names the first rigid body
+        # (Pelvis) as the humanoid root.  Immediately after Isaac Gym reset,
+        # the actor-root tensor can still contain the pre-refresh pelvis
+        # height while the rigid-body tensor already has the simulator state.
+        # Record the named live Pelvis state so reset and subsequent rollout
+        # frames use one canonical state source.
+        self._phc_reset_human_root_state[env_ids] = human_body_state[env_ids, 0]
         self._phc_reset_human_dof_pos[env_ids] = self._dof_pos[env_ids]
         self._phc_reset_human_body_state[env_ids] = human_body_state[env_ids]
         self._phc_reset_object_root_state[env_ids] = self._target_states[env_ids]

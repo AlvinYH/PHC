@@ -1,0 +1,66 @@
+# Case-independent Studio-native residual PPO configuration.  Per-case input,
+# RMS, optimizer, checkpoints and output directory are supplied by train.py.
+params:
+  seed: 42
+  algo:
+    name: ours
+  model:
+    name: ours
+  network:
+    name: actor_critic
+    separate: ???
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: const_initializer
+          val: ???
+        sigma_init:
+          name: const_initializer
+          val: ???
+        fixed_sigma: ???
+        learn_sigma: ???
+    mlp:
+      units: ???
+      activation: ???
+      d2rl: false
+      initializer:
+        name: default
+      regularizer:
+        name: None
+  load_checkpoint: false
+  config:
+    name: ours
+    env_name: rlgpu
+    multi_gpu: false
+    ppo: true
+    mixed_precision: ???
+    normalize_input: ???
+    normalize_amp_input: false
+    disc_reward_scale: 0.0
+    normalize_value: ???
+    reward_shaper:
+      scale_value: 1
+    normalize_advantage: ???
+    gamma: ???
+    tau: ???
+    learning_rate: ???
+    lr_schedule: ???
+    score_to_win: 20000
+    max_epochs: ???
+    save_best_after: ???
+    save_frequency: ???
+    print_stats: true
+    grad_norm: ???
+    entropy_coef: ???
+    truncate_grads: ???
+    e_clip: ???
+    horizon_length: ???
+    minibatch_size: ???
+    mini_epochs: ???
+    critic_coef: ???
+    clip_value: ???
+    bounds_loss_coef: ???
+    player:
+      games_num: 1

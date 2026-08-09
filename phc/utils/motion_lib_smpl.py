@@ -135,7 +135,11 @@ class MotionLibSMPL(MotionLibBase):
             B, J, N = pose_quat_global.shape
 
             ##### ZL: randomize the heading ######
-            if (not flags.im_eval) and (not flags.test):
+            if (
+                config.randomrize_heading
+                and (not flags.im_eval)
+                and (not flags.test)
+            ):
                 # if True:
                 random_rot = np.zeros(3)
                 random_rot[2] = np.pi * (2 * np.random.random() - 1.0)
@@ -178,4 +182,3 @@ class MotionLibSMPL(MotionLibBase):
             queue.put(res)
         else:
             return res
-

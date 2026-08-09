@@ -31,6 +31,7 @@ import os
 import sys
 import pdb
 import os.path as osp
+from pathlib import Path
 os.environ["OMP_NUM_THREADS"] = "1"
 
 sys.path.append(os.getcwd())
@@ -62,6 +63,7 @@ from learning import amp_models
 from learning import amp_network_builder
 from learning import amp_network_mcp_builder
 from learning import amp_network_pnn_builder
+from pipeline.physics.ours.rlgames import register_ours_rlgames
 
 from env.tasks import humanoid_amp_task
 import hydra
@@ -259,6 +261,8 @@ def build_alg_runner(algo_observer):
     runner.algo_factory.register_builder('im_amp', lambda **kwargs: im_amp.IMAmpAgent(**kwargs))
     runner.player_factory.register_builder('im_amp', lambda **kwargs: im_amp_players.IMAMPPlayerContinuous(**kwargs))
     runner.player_factory.register_builder('im_amp_studio', lambda **kwargs: im_amp_studio_players.IMAMPStudioPlayerContinuous(**kwargs))
+
+    register_ours_rlgames(runner)
     
     return runner
 
@@ -327,6 +331,12 @@ def main(cfg_hydra: DictConfig) -> None:
         else:
             print(path)
             raise Exception("no file to resume!!!!")
+
+    if cfg_train["params"].get("load_checkpoint", False):
+        checkpoint = cfg_train["params"].get("load_path")
+        if not checkpoint:
+            raise ValueError("load_checkpoint=True requires learning.params.load_path")
+        cfg["checkpoint"] = checkpoint
 
     
     os.makedirs(cfg.output_path, exist_ok=True)

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import joblib
 import numpy as np
+import torch
 
 from learning.im_amp_players import IMAMPPlayerContinuous
 from phc.utils.flags import flags
@@ -63,6 +64,20 @@ class IMAMPStudioPlayerContinuous(IMAMPPlayerContinuous):
         super().__init__(params)
         self._studio_frames = []
         self._studio_written = False
+        if flags.im_eval:
+            # The upstream progress formatter calls ``np.mean(mpjpe_all)`` on
+            # every frame before it has appended the first completed motion.
+            # Seed the display-only nested aggregate so it is finite during
+            # that prefix.  It neither changes actions/rewards nor resets an
+            # environment; the Studio host's own final eval JSON remains the
+            # authoritative measurement.
+            self.mpjpe_all = [[torch.zeros((), device=self.device)]]
+
+    def restore(self, fn):
+        super().restore(fn)
+        arm = getattr(self.env.task, "arm_ours_closed_loop_replay", None)
+        if arm is not None:
+            arm()
 
     def _post_step(self, info, done):
         if flags.im_eval:
@@ -91,7 +106,15 @@ class IMAMPStudioPlayerContinuous(IMAMPPlayerContinuous):
             flags.im_eval
             and not self._studio_written
             and self._studio_frames
-            and bool(done.all())
+            # The PHC evaluation player finishes a fixed reference at its
+            # horizon without necessarily setting a vector ``done`` bit on
+            # the final frame.  The Studio recorder therefore accepts either
+            # native terminal signal or the exact single-motion frame count.
+            and (
+                bool(done.all())
+                or len(self._studio_frames)
+                >= int(self.env.task._motion_lib.get_motion_num_steps().max().item()) - 1
+            )
         ):
             task = self.env.task
             if task.num_envs != 1 or task._motion_lib._num_unique_motions != 1:

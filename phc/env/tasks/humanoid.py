@@ -543,7 +543,7 @@ class Humanoid(BaseTask):
         
         self._reset_envs(env_ids)
 
-        if safe_reset:
+        if safe_reset and not self.cfg["env"].get("oursDiagnosticSingleReset", False):
             # import ipdb; ipdb.set_trace()
             # print("3resetting here!!!!", self._humanoid_root_states[0, :3] - self._rigid_body_pos[0, 0])
             # ZL: This way it will simuate one step, then get reset again, squashing any remaining wiredness. Temporary fix
@@ -877,7 +877,9 @@ class Humanoid(BaseTask):
 
                 for idx in np.arange(num_envs):
                     gender_beta, asset_file_real = res_acc[idx]
-                    humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file_real, asset_options)
+                    asset_file_root = os.path.dirname(asset_file_real) if os.path.isabs(asset_file_real) else asset_root
+                    asset_file_name = os.path.basename(asset_file_real) if os.path.isabs(asset_file_real) else asset_file_real
+                    humanoid_asset = self.gym.load_asset(self.sim, asset_file_root, asset_file_name, asset_options)
                     actuator_props = self.gym.get_asset_actuator_properties(humanoid_asset)
                     motor_efforts = [prop.motor_effort for prop in actuator_props]
                     
@@ -899,7 +901,9 @@ class Humanoid(BaseTask):
                 gender_beta, asset_file_real = self._create_smpl_humanoid_xml([0], robot, None, 0)[0]
                 sk_tree = SkeletonTree.from_mjcf(asset_file_real)
 
-                humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file_real, asset_options)
+                asset_file_root = os.path.dirname(asset_file_real) if os.path.isabs(asset_file_real) else asset_root
+                asset_file_name = os.path.basename(asset_file_real) if os.path.isabs(asset_file_real) else asset_file_real
+                humanoid_asset = self.gym.load_asset(self.sim, asset_file_root, asset_file_name, asset_options)
                 actuator_props = self.gym.get_asset_actuator_properties(humanoid_asset)
                 motor_efforts = [prop.motor_effort for prop in actuator_props]
 
@@ -976,7 +980,8 @@ class Humanoid(BaseTask):
         self.dof_limits_lower = []
         self.dof_limits_upper = []
         
-        max_agg_bodies, max_agg_shapes = 160, 160
+        max_agg_bodies = int(self.cfg["env"].get("aggregateBodies", 160))
+        max_agg_shapes = int(self.cfg["env"].get("aggregateShapes", 160))
         for i in range(self.num_envs):
             # create env instance
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
@@ -1096,7 +1101,10 @@ class Humanoid(BaseTask):
             char_h = 0.89
 
         pos = torch.tensor(get_axis_params(char_h, self.up_axis_idx)).to(self.device)
-        pos[:2] += torch_rand_float(-1., 1., (2, 1), device=self.device).squeeze(1)  # ZL: segfault if we do not randomize the position
+        if not self.cfg["env"].get("disableActorCreationJitter", False):
+            pos[:2] += torch_rand_float(
+                -1., 1., (2, 1), device=self.device
+            ).squeeze(1)
 
         start_pose.p = gymapi.Vec3(*pos)
         start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
