@@ -1,0 +1,25 @@
+sim_device: "cuda:0"
+pipeline: "gpu"
+graphics_device_id: 0
+subscenes: 0
+slices: 0
+use_flex: False
+
+# Production Studio residual simulation. Keep this file in the Hydra sim
+# search root: production configs select it as ``sim=ours_contact2mm_sim``.
+substeps: 2
+physx:
+  step_dt: 1/60
+  num_threads: 4
+  solver_type: 1
+  num_position_iterations: 4
+  num_velocity_iterations: 0
+  contact_offset: 0.002
+  rest_offset: 0.0
+  bounce_threshold_velocity: 0.2
+  max_depenetration_velocity: 10.0
+  default_buffer_size_multiplier: 10.0
+
+flex:
+  num_inner_iterations: 10
+  warm_start: 0.25
