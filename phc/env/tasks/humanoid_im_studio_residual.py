@@ -56,7 +56,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("ours Hybrid max fraction must be in [0,1]")
         self._ours_hybrid_start_mask = None
         self._ours_reference_path = Path(env["oursReferencePath"]).expanduser()
-        self._ours_config_path = Path(env["oursResolvedConfigPath"]).expanduser()
+        self._ours_reward_weights = dict(env["oursReward"])
+        self._ours_reset = dict(env["oursReset"])
+        self._ours_teacher_frame_offset = int(env.get("oursTeacherFrameOffset", 0))
         self._ours_tracker_path = Path(env["studioTrackerCheckpoint"]).expanduser()
         self._ours_tracker_activation = env["studioTrackerActivation"]
         self._ours_trace_path = Path(env["oursTracePath"]).expanduser() if env.get("oursTracePath") else None
@@ -205,21 +207,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
     def _ours_prepare_files(self):
         for path, description in (
             (self._ours_reference_path, "articulated reference"),
-            (self._ours_config_path, "resolved config"),
             (self._ours_tracker_path, "PHC-X tracker checkpoint"),
         ):
             if not path.is_file():
                 raise FileNotFoundError(f"Studio {description} is missing: {path}")
         if self._ours_tracker_activation != "silu":
             raise ValueError("Studio tracker activation must be SiLU")
-        config = json.loads(self._ours_config_path.read_text(encoding="utf-8"))
-        if config["method"] != "ours" or config["observation"] != {"normalize_input": True}:
-            raise ValueError("resolved Studio config is not the ours baseline")
-        self._ours_reward_weights = config["ours"]["reward"]
-        self._ours_reset = config["ours"]["reset"]
-        self._ours_teacher_frame_offset = int(
-            config.get("diagnostic_teacher_frame_offset", 0)
-        )
         if self._ours_teacher_frame_offset not in (0, 1):
             raise ValueError("diagnostic teacher frame offset must be 0 or 1")
         if self._ours_reward_weights["ig"] != 0.0 or self._ours_reward_weights["handle_normal"] != 0.0:
@@ -241,6 +234,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "policy_root_link_names", "policy_active_child_link_names",
             "policy_root_bbox", "policy_active_child_bbox",
             "collision_surface_points_link_local_scaled", "collision_surface_point_link_names",
+            "contact_labels",
         }
         with np.load(self._ours_reference_path, allow_pickle=False) as data:
             missing = sorted(needed.difference(data.files))
@@ -360,6 +354,82 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 action if self._ours_batch_replay
                 else action[:self._ours_closed_loop_trace_steps]
             )
+
+    def _load_contact_region_points(self, object_config):
+        """Read Ours' object geometry from the native PHC config."""
+
+        points = np.asarray(object_config["contact_region_points"], dtype=np.float32)
+        names = [str(name) for name in object_config["contact_region_point_link_names"]]
+        if (
+            points.ndim != 2
+            or points.shape[1] != 3
+            or not len(points)
+            or len(names) != len(points)
+            or not np.isfinite(points).all()
+            or any(not name for name in names)
+        ):
+            raise ValueError("Studio contact-region points must be finite named [P,3]")
+        return points, names
+
+    def _load_contact_reference(self):
+        """Use the single Ours reference instead of a PHC-X sidecar."""
+
+        labels_hand2 = np.asarray(
+            self._ours_reference_np["contact_labels"], dtype=np.float32
+        )
+        if labels_hand2.shape != (self._target_joint_qpos.shape[0], 2):
+            raise ValueError("Studio contact labels must align with object qpos")
+        labels = np.concatenate(
+            (
+                np.repeat(labels_hand2[:, 0:1], 5, axis=1),
+                np.repeat(labels_hand2[:, 1:2], 5, axis=1),
+            ),
+            axis=1,
+        )
+        self._phc_contact_labels_10 = torch.tensor(
+            labels, dtype=torch.float32, device=self.device
+        )
+        self._phc_contact_labels_hand2 = torch.tensor(
+            labels_hand2, dtype=torch.float32, device=self.device
+        )
+        self._phc_contact_obj_ref = torch.tensor(
+            np.any(labels_hand2 > 0.5, axis=1, keepdims=True).astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def _load_target_joint_qpos(self):
+        """Use the single Ours reference instead of a PHC-X sidecar."""
+
+        qpos = np.asarray(self._ours_reference_np["object_joint_qpos"], dtype=np.float32)
+        names = list(self._ours_reference_joint_names)
+        if qpos.ndim != 2 or not len(qpos) or not np.isfinite(qpos).all():
+            raise ValueError("Studio object qpos must be finite [T,J]")
+        if names != list(self._target_joint_names) or qpos.shape[1] != len(names):
+            raise ValueError("Studio object qpos joint names disagree with PHC config")
+        dof_indices = []
+        for name in names:
+            if name not in self._target_asset_dof_names:
+                raise ValueError(f"Studio object joint is missing from asset: {name}")
+            dof_indices.append(self._target_asset_dof_names.index(name))
+        full_qpos = np.zeros((qpos.shape[0], self._target_max_dof), dtype=np.float32)
+        full_qpos[:, dof_indices] = qpos
+        self._target_active_dof_indices = torch.tensor(
+            dof_indices, dtype=torch.long, device=self.device
+        )
+        self._target_joint_qpos = torch.tensor(
+            full_qpos, dtype=torch.float32, device=self.device
+        )
+        initial = np.asarray(
+            self._phc_object_config["initial_joint_qpos"], dtype=np.float32
+        ).reshape(-1)
+        if initial.shape != (len(names),) or not np.isfinite(initial).all():
+            raise ValueError("Studio initial object qpos must match object joints")
+        full_initial = np.zeros((self._target_max_dof,), dtype=np.float32)
+        full_initial[dof_indices] = initial
+        self._target_initial_joint_qpos = torch.tensor(
+            full_initial, dtype=torch.float32, device=self.device
+        )
 
     def _ours_bind_studio_tensors(self):
         if self.obs_buf.shape[1] != OBSERVATION_DIM or self.num_bodies != 52:
