@@ -228,8 +228,6 @@ class MotionLibBase():
         torch.set_num_threads(1)
         mp.set_sharing_strategy('file_descriptor')
 
-        manager = mp.Manager()
-        queue = manager.Queue()
         num_jobs = min(mp.cpu_count(), 64)
 
         if num_jobs <= 8 or not self.multi_thread:
@@ -244,15 +242,20 @@ class MotionLibBase():
 
         jobs = [(ids[i:i + chunk], jobs[i:i + chunk], skeleton_trees[i:i + chunk], gender_betas[i:i + chunk],  self.mesh_parsers, self.m_cfg) for i in range(0, len(jobs), chunk)]
         job_args = [jobs[i] for i in range(len(jobs))]
-        for i in range(1, len(jobs)):
-            worker_args = (*job_args[i], queue, i)
-            worker = mp.Process(target=self.load_motion_with_skeleton, args=worker_args)
-            worker.start()
-        res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
-
-        for i in tqdm(range(len(jobs) - 1)):
-            res = queue.get()
-            res_acc.update(res)
+        if len(jobs) > 1:
+            manager = mp.Manager()
+            queue = manager.Queue()
+            for i in range(1, len(jobs)):
+                worker_args = (*job_args[i], queue, i)
+                worker = mp.Process(target=self.load_motion_with_skeleton, args=worker_args)
+                worker.start()
+            res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
+            for i in tqdm(range(len(jobs) - 1)):
+                res = queue.get()
+                res_acc.update(res)
+        else:
+            # 单 motion 直接加载，避免为一个任务启动额外 manager 进程。
+            res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
 
         for f in tqdm(range(len(res_acc))):
             motion_file_data, curr_motion = res_acc[f]

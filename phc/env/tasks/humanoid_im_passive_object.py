@@ -343,13 +343,18 @@ class HumanoidImPassiveObject(HumanoidIm):
         # capacity error when that aggregate is undersized.  Reserve the
         # existing humanoid budget plus the actual Studio object asset count
         # before Humanoid starts the aggregate for each environment.
-        env_cfg = self.cfg["env"]
-        base_bodies = int(env_cfg.get("aggregateBodies", 160))
-        base_shapes = int(env_cfg.get("aggregateShapes", 160))
         target_bodies = int(self.gym.get_asset_rigid_body_count(self._target_asset))
         target_shapes = int(self.gym.get_asset_rigid_shape_count(self._target_asset))
-        env_cfg["aggregateBodies"] = max(base_bodies, base_bodies + target_bodies)
-        env_cfg["aggregateShapes"] = max(base_shapes, base_shapes + target_shapes)
+        static_bodies = sum(
+            self.gym.get_asset_rigid_body_count(asset)
+            for asset in self._target_static_box_assets
+        )
+        static_shapes = sum(
+            self.gym.get_asset_rigid_shape_count(asset)
+            for asset in self._target_static_box_assets
+        )
+        self._aggregate_extra_bodies = target_bodies + static_bodies
+        self._aggregate_extra_shapes = target_shapes + static_shapes
         super()._create_envs(num_envs, spacing, num_per_row)
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):

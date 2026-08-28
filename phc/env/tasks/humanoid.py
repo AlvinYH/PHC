@@ -980,8 +980,22 @@ class Humanoid(BaseTask):
         self.dof_limits_lower = []
         self.dof_limits_upper = []
         
-        max_agg_bodies = int(self.cfg["env"].get("aggregateBodies", 160))
-        max_agg_shapes = int(self.cfg["env"].get("aggregateShapes", 160))
+        humanoid_bodies = max(
+            self.gym.get_asset_rigid_body_count(asset)
+            for asset in self.humanoid_assets
+        )
+        humanoid_shapes = max(
+            self.gym.get_asset_rigid_shape_count(asset)
+            for asset in self.humanoid_assets
+        )
+        max_agg_bodies = max(
+            int(self.cfg["env"].get("aggregateBodies", 160)),
+            humanoid_bodies + int(getattr(self, "_aggregate_extra_bodies", 0)),
+        )
+        max_agg_shapes = max(
+            int(self.cfg["env"].get("aggregateShapes", 160)),
+            humanoid_shapes + int(getattr(self, "_aggregate_extra_shapes", 0)),
+        )
         for i in range(self.num_envs):
             # create env instance
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)

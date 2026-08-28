@@ -233,6 +233,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "active_parent_link_names", "active_child_link_names", "active_parent_bbox", "active_child_bbox",
             "policy_root_link_names", "policy_active_child_link_names",
             "policy_root_bbox", "policy_active_child_bbox",
+            "object_surface_mode",
             "collision_surface_points_link_local_scaled", "collision_surface_point_link_names",
             "contact_labels",
         }
@@ -241,6 +242,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             if missing:
                 raise ValueError("Studio articulated reference lacks: " + ", ".join(missing))
             self._ours_reference_np = {name: np.asarray(data[name]) for name in needed}
+        surface_mode = str(self._ours_reference_np["object_surface_mode"].item())
+        if self._phc_object_config["object_surface_mode"] != surface_mode:
+            raise ValueError(
+                "Studio PHC contact gates must use the selected collision surface"
+            )
         active = tuple(str(name) for name in self._ours_reference_np["active_joint_names"].reshape(-1))
         if len(active) != 1:
             raise ValueError("ours requires exactly one active joint")
@@ -993,11 +999,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             ).any(dim=-1)
             for side in ("left_hand", "right_hand")
         ), dim=-1)
-        reset_live_contact = (
-            self._ours_live_hand_region_contact
-            if self._ours_reset.get("required_hand_contact_region_only", False)
-            else self._ours_live_hand_contact
-        )
         self._ours_human_reset, self._ours_object_reset, self._ours_contact_reset = reward_reset_signals(
             self._rigid_body_pos,
             reference["rg_pos"],
@@ -1009,7 +1010,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_contact_reset,
             float(self._ours_reset["human_key_body_error"]),
             float(self._ours_reset["object_surface_error"]),
-            live_hand_contact=reset_live_contact,
+            live_hand_contact=self._ours_live_hand_region_contact,
         )
         if (
             self._ours_closed_loop_trace_path is not None
@@ -1084,17 +1085,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             required = self._ours_required_hand_contact[:, index]
             live = self._ours_live_hand_contact[:, index]
             live_region = self._ours_live_hand_region_contact[:, index]
-            reset_live = (
-                live_region
-                if self._ours_reset.get("required_hand_contact_region_only", False)
-                else live
-            )
             signals["required_" + side] = required
             signals["live_" + side] = live
             signals["missing_" + side] = required & ~live
             signals["live_region_" + side] = live_region
             signals["missing_region_" + side] = required & ~live_region
-            signals["reset_live_" + side] = reset_live
+            signals["reset_live_" + side] = live_region
             signals["contact_" + side] = started & self._ours_contact_reset[:, index].gt(
                 int(self._ours_reset["required_hand_contact_mismatch_steps"])
             )
