@@ -40,6 +40,14 @@ class HumanoidImPassiveObject(HumanoidIm):
 
         object_config = json.loads(object_config_path.read_text(encoding="utf-8"))
         self._phc_object_config = object_config
+        static_collision_filter = object_config.get("static_box_collision_filter", 0)
+        if (
+            isinstance(static_collision_filter, bool)
+            or not isinstance(static_collision_filter, int)
+            or static_collision_filter < 0
+        ):
+            raise ValueError("static_box_collision_filter must be a non-negative integer")
+        self._target_static_box_collision_filter = static_collision_filter
         self._target_name = object_config["object_name"]
         self._target_default_root_pos_np = np.asarray(
             object_config["target_default_root_pos"], dtype=np.float32
@@ -336,24 +344,39 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._target_handles = []
         self._target_static_box_handles = []
         self._load_target_asset()
-        # Humanoid's existing aggregate default reserves 160 slots.  This is
-        # enough for its own asset, but a Studio canonical object may contain
-        # hundreds of collision submeshes (for example the PartNet washing
-        # machine).  Isaac Gym corrupts native memory rather than reporting a
-        # capacity error when that aggregate is undersized.  Reserve the
-        # existing humanoid budget plus the actual Studio object asset count
-        # before Humanoid starts the aggregate for each environment.
-        env_cfg = self.cfg["env"]
-        base_bodies = int(env_cfg.get("aggregateBodies", 160))
-        base_shapes = int(env_cfg.get("aggregateShapes", 160))
+        # The parent reserves each aggregate after it has loaded the humanoid
+        # asset.  Give it the exact capacity contributed by this task's extra
+        # actors instead of treating its historical default of 160 as a count
+        # of humanoid bodies or shapes.  Static support boxes are actors too.
         target_bodies = int(self.gym.get_asset_rigid_body_count(self._target_asset))
         target_shapes = int(self.gym.get_asset_rigid_shape_count(self._target_asset))
-        env_cfg["aggregateBodies"] = max(base_bodies, base_bodies + target_bodies)
-        env_cfg["aggregateShapes"] = max(base_shapes, base_shapes + target_shapes)
+        static_bodies = sum(
+            int(self.gym.get_asset_rigid_body_count(asset))
+            for asset in self._target_static_box_assets
+        )
+        static_shapes = sum(
+            int(self.gym.get_asset_rigid_shape_count(asset))
+            for asset in self._target_static_box_assets
+        )
+        self._aggregate_extra_bodies = target_bodies + static_bodies
+        self._aggregate_extra_shapes = target_shapes + static_shapes
         super()._create_envs(num_envs, spacing, num_per_row)
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):
         super()._build_env(env_id, env_ptr, humanoid_asset)
+        humanoid_handle = self.humanoid_handles[env_id]
+        humanoid_shapes = self.gym.get_actor_rigid_shape_properties(
+            env_ptr, humanoid_handle
+        )
+        for shape in humanoid_shapes:
+            shape.friction = self._phc_object_config["shape_friction"]
+            shape.restitution = self._phc_object_config["shape_restitution"]
+            shape.rolling_friction = self._phc_object_config["shape_rolling_friction"]
+            shape.torsion_friction = self._phc_object_config["shape_torsion_friction"]
+            shape.rest_offset = self._phc_object_config["shape_rest_offset"]
+        self.gym.set_actor_rigid_shape_properties(
+            env_ptr, humanoid_handle, humanoid_shapes
+        )
         from pipeline.physics.articulated_scene import validate_humanoid_object_collision_filters
 
         validate_humanoid_object_collision_filters(
@@ -362,10 +385,7 @@ class HumanoidImPassiveObject(HumanoidIm):
             self.humanoid_handles[env_id],
         )
         self._build_target(env_id, env_ptr)
-        from pipeline.physics.articulated_scene import (
-            STATIC_SCENE_COLLISION_FILTER,
-            create_static_box_actors,
-        )
+        from pipeline.physics.articulated_scene import create_static_box_actors
 
         self._target_static_box_handles.extend(
             create_static_box_actors(
@@ -374,7 +394,7 @@ class HumanoidImPassiveObject(HumanoidIm):
                 env_id,
                 self._target_static_box_assets,
                 self._phc_object_config,
-                collision_filter=STATIC_SCENE_COLLISION_FILTER,
+                collision_filter=self._target_static_box_collision_filter,
             )
         )
 

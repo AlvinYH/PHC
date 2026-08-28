@@ -115,7 +115,9 @@ class MotionLibBase():
 
     def __init__(self, motion_lib_cfg):
         self.m_cfg = motion_lib_cfg
-        self._sim_fps = 1/self.m_cfg.get("step_dt", 1/30)
+        # Motion reference timing must be explicitly declared by the selected
+        # physics sim config; a hidden 30 Hz fallback invalidates comparisons.
+        self._sim_fps = 1 / self.m_cfg["step_dt"]
         print("SIM FPS:", self._sim_fps)
         self._device = self.m_cfg.device
         
@@ -228,8 +230,6 @@ class MotionLibBase():
         torch.set_num_threads(1)
         mp.set_sharing_strategy('file_descriptor')
 
-        manager = mp.Manager()
-        queue = manager.Queue()
         num_jobs = min(mp.cpu_count(), 64)
 
         if num_jobs <= 8 or not self.multi_thread:
@@ -244,6 +244,14 @@ class MotionLibBase():
 
         jobs = [(ids[i:i + chunk], jobs[i:i + chunk], skeleton_trees[i:i + chunk], gender_betas[i:i + chunk],  self.mesh_parsers, self.m_cfg) for i in range(0, len(jobs), chunk)]
         job_args = [jobs[i] for i in range(len(jobs))]
+
+        # A serial load has no worker results to transfer.  Starting a
+        # multiprocessing manager in that case forks a server after Isaac
+        # Gym/CUDA initialization and is both unnecessary and unsafe.
+        queue = None
+        if len(jobs) > 1:
+            manager = mp.Manager()
+            queue = manager.Queue()
         for i in range(1, len(jobs)):
             worker_args = (*job_args[i], queue, i)
             worker = mp.Process(target=self.load_motion_with_skeleton, args=worker_args)

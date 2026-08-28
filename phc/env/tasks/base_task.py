@@ -60,6 +60,7 @@ from tqdm import tqdm
 class BaseTask():
 
     def __init__(self, cfg, enable_camera_sensors=False):
+        self.cfg = cfg
         self.headless = cfg["headless"]
         if self.headless == False and not flags.no_virtual_display:
             from pyvirtualdisplay.smartdisplay import SmartDisplay
@@ -89,7 +90,7 @@ class BaseTask():
         self.num_actions = cfg["env"]["numActions"]
         self.is_discrete = cfg["env"].get("is_discrete", False)
 
-        self.control_freq_inv = cfg["control"].get("decimation", 2)
+        self.control_freq_inv = cfg["control"]["decimation"]
 
         # optimization flags for pytorch JIT
         torch._C._jit_set_profiling_mode(False)
@@ -199,9 +200,10 @@ class BaseTask():
     def set_sim_params_up_axis(self, sim_params, axis):
         if axis == 'z':
             sim_params.up_axis = gymapi.UP_AXIS_Z
-            sim_params.gravity.x = 0
-            sim_params.gravity.y = 0
-            sim_params.gravity.z = -9.81
+            gravity = self.cfg["env"]["gravity"]
+            sim_params.gravity.x = gravity[0]
+            sim_params.gravity.y = gravity[1]
+            sim_params.gravity.z = gravity[2]
             return 2
         return 1
 

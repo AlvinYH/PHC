@@ -980,8 +980,27 @@ class Humanoid(BaseTask):
         self.dof_limits_lower = []
         self.dof_limits_upper = []
         
-        max_agg_bodies = int(self.cfg["env"].get("aggregateBodies", 160))
-        max_agg_shapes = int(self.cfg["env"].get("aggregateShapes", 160))
+        # Aggregate capacities must cover the loaded humanoid asset plus
+        # any task-specific actors.  A fixed historical default can silently
+        # become too small when a task adds articulated or support assets.
+        humanoid_bodies = max(
+            int(self.gym.get_asset_rigid_body_count(asset))
+            for asset in self.humanoid_assets
+        )
+        humanoid_shapes = max(
+            int(self.gym.get_asset_rigid_shape_count(asset))
+            for asset in self.humanoid_assets
+        )
+        extra_bodies = int(getattr(self, "_aggregate_extra_bodies", 0))
+        extra_shapes = int(getattr(self, "_aggregate_extra_shapes", 0))
+        max_agg_bodies = max(
+            int(self.cfg["env"].get("aggregateBodies", 160)),
+            humanoid_bodies + extra_bodies,
+        )
+        max_agg_shapes = max(
+            int(self.cfg["env"].get("aggregateShapes", 160)),
+            humanoid_shapes + extra_shapes,
+        )
         for i in range(self.num_envs):
             # create env instance
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)

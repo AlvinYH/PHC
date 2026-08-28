@@ -48,9 +48,15 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 self.num_envs, dtype=torch.long, device=self.device
             )
         self._reset_envs(env_ids)
+        from scripts.physics.capture_isaac_runtime import write_requested_task_physics
+        write_requested_task_physics(self)
 
     def __init__(self, cfg, sim_params, physics_engine, device_type, device_id, headless):
         env = cfg["env"]
+        # PHC's Isaac Gym binding corrupts heap state at teardown after actor
+        # body-property queries. Shapes, DOFs, and root poses are still read
+        # from every actor by the runtime acceptance snapshot.
+        self._runtime_skip_body_property_readback = True
         self._ours_hybrid_init_max_fraction = float(env["hybridInitMaxFraction"])
         if not 0.0 <= self._ours_hybrid_init_max_fraction <= 1.0:
             raise ValueError("ours Hybrid max fraction must be in [0,1]")
@@ -109,6 +115,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_bind_studio_tensors()
         self._compute_observations()
         self._ours_capture_trace()
+        from scripts.physics.capture_isaac_runtime import request_task_physics_dump
+        request_task_physics_dump(self)
 
     def arm_ours_closed_loop_replay(self):
         """Start bounded replay after the residual player restores its policy."""
@@ -233,7 +241,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "active_parent_link_names", "active_child_link_names", "active_parent_bbox", "active_child_bbox",
             "policy_root_link_names", "policy_active_child_link_names",
             "policy_root_bbox", "policy_active_child_bbox",
-            "collision_surface_points_link_local_scaled", "collision_surface_point_link_names",
+            "object_surface_mode", "collision_surface_points_link_local_scaled",
+            "collision_surface_point_link_names",
             "contact_labels",
         }
         with np.load(self._ours_reference_path, allow_pickle=False) as data:
@@ -241,6 +250,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             if missing:
                 raise ValueError("Studio articulated reference lacks: " + ", ".join(missing))
             self._ours_reference_np = {name: np.asarray(data[name]) for name in needed}
+        mode_value = self._ours_reference_np["object_surface_mode"]
+        if mode_value.size != 1:
+            raise ValueError("Studio object_surface_mode must be scalar")
+        self._ours_object_surface = str(mode_value.reshape(-1)[0])
+        if self._ours_object_surface not in ("active_part", "full_object"):
+            raise ValueError("Studio object_surface_mode is invalid")
         active = tuple(str(name) for name in self._ours_reference_np["active_joint_names"].reshape(-1))
         if len(active) != 1:
             raise ValueError("ours requires exactly one active joint")
@@ -473,6 +488,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         object_names = [str(name) for name in self._target_body_names]
         if self._ours_parent_link not in object_names or self._ours_child_link not in object_names:
             raise ValueError("Studio active parent/child link is absent from the PHC object")
+        if "object_surface_mode" not in self._phc_object_config:
+            raise ValueError("Studio PHC object config is missing object_surface_mode")
+        if self._phc_object_config["object_surface_mode"] != self._ours_object_surface:
+            raise ValueError("Studio PHC object-surface mode differs from its reference")
         policy_roots = tuple(
             str(name)
             for name in self._ours_reference_np["policy_root_link_names"].reshape(-1)
@@ -546,7 +565,28 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         surface_names = [str(name) for name in ref["collision_surface_point_link_names"].reshape(-1)]
         if set(surface_names).difference(object_names):
             raise ValueError("Studio surface geometry names are absent from the PHC object")
-        self._ours_surface_points_local = torch.tensor(ref["collision_surface_points_link_local_scaled"], dtype=torch.float32, device=self.device)
+        if self._ours_object_surface == "active_part" and set(surface_names) != {self._ours_child_link}:
+            raise ValueError("Studio active_part surface must contain only the active child link")
+        surface_points = np.asarray(
+            ref["collision_surface_points_link_local_scaled"], dtype=np.float32
+        )
+        contact_points = np.asarray(
+            self._phc_object_config["contact_region_points"], dtype=np.float32
+        )
+        contact_names = [
+            str(name)
+            for name in self._phc_object_config["contact_region_point_link_names"]
+        ]
+        if (
+            contact_names != surface_names
+            or not np.array_equal(contact_points, surface_points)
+            or tuple(self._phc_contact_region_names)
+            != tuple(dict.fromkeys(surface_names))
+        ):
+            raise ValueError(
+                "Studio PHC contact gates must use the selected collision surface"
+            )
+        self._ours_surface_points_local = torch.tensor(surface_points, dtype=torch.float32, device=self.device)
         self._ours_surface_link_ids = torch.tensor([object_names.index(name) for name in surface_names], dtype=torch.long, device=self.device)
         self._ours_reference_surface = self._ours_world_surface_points(self._ours_ref_all_links)
         self._ours_bbox = torch.tensor(
@@ -993,11 +1033,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             ).any(dim=-1)
             for side in ("left_hand", "right_hand")
         ), dim=-1)
-        reset_live_contact = (
-            self._ours_live_hand_region_contact
-            if self._ours_reset.get("required_hand_contact_region_only", False)
-            else self._ours_live_hand_contact
-        )
         self._ours_human_reset, self._ours_object_reset, self._ours_contact_reset = reward_reset_signals(
             self._rigid_body_pos,
             reference["rg_pos"],
@@ -1009,7 +1044,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_contact_reset,
             float(self._ours_reset["human_key_body_error"]),
             float(self._ours_reset["object_surface_error"]),
-            live_hand_contact=reset_live_contact,
+            live_hand_contact=self._ours_live_hand_region_contact,
         )
         if (
             self._ours_closed_loop_trace_path is not None
@@ -1084,11 +1119,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             required = self._ours_required_hand_contact[:, index]
             live = self._ours_live_hand_contact[:, index]
             live_region = self._ours_live_hand_region_contact[:, index]
-            reset_live = (
-                live_region
-                if self._ours_reset.get("required_hand_contact_region_only", False)
-                else live
-            )
+            reset_live = live_region
             signals["required_" + side] = required
             signals["live_" + side] = live
             signals["missing_" + side] = required & ~live

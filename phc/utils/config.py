@@ -170,7 +170,8 @@ def load_cfg(args):
 def parse_sim_params(args, cfg, cfg_train):
     # initialize sim
     sim_params = gymapi.SimParams()
-    sim_params.dt = eval(cfg.sim.physx.step_dt)
+    step_dt = cfg.sim.physx.step_dt
+    sim_params.dt = float(step_dt) if isinstance(step_dt, (int, float)) else eval(step_dt)
     sim_params.num_client_threads = args.slices
 
     if args.physics_engine == gymapi.SIM_FLEX:
