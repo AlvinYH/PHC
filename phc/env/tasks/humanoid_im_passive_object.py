@@ -374,7 +374,13 @@ class HumanoidImPassiveObject(HumanoidIm):
                 env_id,
                 self._target_static_box_assets,
                 self._phc_object_config,
-                collision_filter=STATIC_SCENE_COLLISION_FILTER,
+                # case 可覆盖静态场景过滤位，使 Ours 与 RePHO 使用同一碰撞契约。
+                collision_filter=int(
+                    self._phc_object_config.get(
+                        "static_box_collision_filter",
+                        STATIC_SCENE_COLLISION_FILTER,
+                    )
+                ),
             )
         )
 
