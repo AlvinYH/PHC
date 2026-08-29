@@ -26,7 +26,6 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 from stl import mesh
 import logging
-import open3d as o3d
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')

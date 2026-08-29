@@ -27,7 +27,9 @@ from pipeline.physics.ours.reward import (
     build_phase_progress_tables,
     compute_reward,
     hand_contact_to_body52,
+    incremental_phase_progress,
     normalized_phase_progress,
+    phase_relative_progress,
     phase_progress_start_qpos,
     reward_body_indices,
     reward_reset_signals,
@@ -48,6 +50,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 self.num_envs, dtype=torch.long, device=self.device
             )
         self._reset_envs(env_ids)
+        # 复用统一的 Isaac Gym 运行时快照，只在启动后的首次 reset 写一次。
+        from scripts.physics.capture_isaac_runtime import write_requested_task_physics
+        write_requested_task_physics(self)
 
     def __init__(self, cfg, sim_params, physics_engine, device_type, device_id, headless):
         env = cfg["env"]
@@ -57,7 +62,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_hybrid_start_mask = None
         self._ours_reference_path = Path(env["oursReferencePath"]).expanduser()
         self._ours_reward_weights = dict(env["oursReward"])
+        self._ours_progress_mode = str(
+            self._ours_reward_weights.pop("progress_mode", "absolute")
+        )
         self._ours_reset = dict(env["oursReset"])
+        self._ours_residual_scale = float(env["oursResidualScale"])
         self._ours_teacher_frame_offset = int(env.get("oursTeacherFrameOffset", 0))
         self._ours_tracker_path = Path(env["studioTrackerCheckpoint"]).expanduser()
         self._ours_tracker_activation = env["studioTrackerActivation"]
@@ -109,6 +118,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_bind_studio_tensors()
         self._compute_observations()
         self._ours_capture_trace()
+        # PHC 的 native binding 读取刚体属性不稳定；快照沿用既有安全回退。
+        self._runtime_skip_body_property_readback = True
+        from scripts.physics.capture_isaac_runtime import request_task_physics_dump
+        request_task_physics_dump(self)
 
     def arm_ours_closed_loop_replay(self):
         """Start bounded replay after the residual player restores its policy."""
@@ -217,6 +230,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("diagnostic teacher frame offset must be 0 or 1")
         if self._ours_reward_weights["ig"] != 0.0 or self._ours_reward_weights["handle_normal"] != 0.0:
             raise ValueError("baseline requires neutral IG and handle-normal")
+        if self._ours_progress_mode not in ("absolute", "phase_relative_delta"):
+            raise ValueError(
+                "ours progress mode must be absolute or phase_relative_delta"
+            )
         if not 0.0 < float(self._ours_reset["termination_height"]):
             raise ValueError("ours termination height must be positive")
         if not 0.0 < float(self._ours_reset["human_key_body_error"]):
@@ -242,11 +259,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             if missing:
                 raise ValueError("Studio articulated reference lacks: " + ", ".join(missing))
             self._ours_reference_np = {name: np.asarray(data[name]) for name in needed}
-        surface_mode = str(self._ours_reference_np["object_surface_mode"].item())
-        if self._phc_object_config["object_surface_mode"] != surface_mode:
-            raise ValueError(
-                "Studio PHC contact gates must use the selected collision surface"
-            )
         active = tuple(str(name) for name in self._ours_reference_np["active_joint_names"].reshape(-1))
         if len(active) != 1:
             raise ValueError("ours requires exactly one active joint")
@@ -438,8 +450,15 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
 
     def _ours_bind_studio_tensors(self):
+        surface_mode = str(self._ours_reference_np["object_surface_mode"].item())
+        if self._phc_object_config["object_surface_mode"] != surface_mode:
+            raise ValueError(
+                "Studio PHC contact gates must use the selected collision surface"
+            )
         if self.obs_buf.shape[1] != OBSERVATION_DIM or self.num_bodies != 52:
-            raise ValueError("ours requires a 2596D observation and 52-body humanoid")
+            raise ValueError(
+                f"ours requires a {OBSERVATION_DIM}D observation and 52-body humanoid"
+            )
         if self._ours_action_replay_np is not None and not self._ours_batch_replay and self.num_envs != 1:
             raise ValueError("bounded action replay requires exactly one Studio environment")
         if self._ours_active_joint_name not in self._target_joint_names or self._ours_active_joint_name not in self._target_asset_dof_names:
@@ -492,6 +511,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "Studio policy bbox owners do not match actor-root/active-child states"
             )
         self._ours_child_body_id = self.num_bodies + object_names.index(self._ours_child_link)
+        self._ours_child_object_index = object_names.index(self._ours_child_link)
         self._ours_root_body_id = self.num_bodies + object_names.index(
             object_names[0]
         )
@@ -592,6 +612,14 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_episode_start_qpos = self._target_dof_pos[
             :, self._ours_active_dof
         ].clone()
+        self._ours_progress_phase_start = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device,
+        )
+        self._ours_progress_phase_entry_qpos = self._ours_episode_start_qpos.clone()
+        self._ours_progress_best = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device,
+        )
+        self._ours_previous_active_qpos = self._ours_episode_start_qpos.clone()
         self._ours_previous_residual = torch.zeros((self.num_envs, 153), dtype=torch.float32, device=self.device)
         self._ours_previous_dof_velocity = torch.zeros_like(self._dof_vel)
         self._ours_previous_object_linear_velocity = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
@@ -711,6 +739,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ), dim=1)
         active = self._target_dof_pos[:, self._ours_active_dof:self._ours_active_dof + 1]
         active_reference = self._target_qpos_ref_for_frames(frames)[:, self._ours_active_dof:self._ours_active_dof + 1]
+        # GT actor root 与 GT active child 沿用 live object_links 的同一双-slot 顺序。
+        reference_object_links = torch.stack((
+            self._ours_ref_root_state[frames],
+            self._ours_ref_all_links[frames, self._ours_child_object_index],
+        ), dim=1)
         observation = build_observation(
             human={
                 "body_observation": residual_body_observation,
@@ -724,9 +757,15 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             object_state={
                 "link_state": object_links,
                 "active_qpos": active,
-                "bbox_corners": self._ours_bbox.unsqueeze(0).expand(self.num_envs, -1, -1, -1),
             },
-            reference={"dof_pos": reference["dof_pos"], "active_qpos": active_reference},
+            reference={
+                "dof_pos": reference["dof_pos"],
+                "active_qpos": active_reference,
+                "human_root_pos": reference["rg_pos"][:, 0],
+                "human_root_rot": reference["rb_rot"][:, 0],
+                "object_root_state": self._ours_ref_root_state[frames],
+                "object_link_state": reference_object_links,
+            },
             teacher_action=teacher,
             contact={"fingertip_force": self._contact_forces[:, self._ours_tip_ids]},
         )
@@ -757,7 +796,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 self._ours_action_replay_index += 1
             elif len(self._ours_closed_loop_rows) < self._ours_closed_loop_trace_steps:
                 raise RuntimeError("bounded action replay ended before the requested trace")
-        final = compose_residual_action(self._ours_teacher_action, residual)
+        final = compose_residual_action(
+            self._ours_teacher_action, residual, self._ours_residual_scale
+        )
         if self._ours_final_action_replay is not None:
             if self._ours_batch_replay:
                 if self._ours_final_action_replay_index:
@@ -917,19 +958,57 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ), dim=-1)
         episode_start = self._ours_episode_start_frames
         phase_start = self._ours_phase_start[frames, 0]
-        qpos_start = phase_progress_start_qpos(
-            phase_start,
-            episode_start,
-            self._target_joint_qpos[:, self._ours_active_dof],
-            self._ours_episode_start_qpos,
-        )
-        progress = normalized_phase_progress(
-            active[:, 0],
-            qpos_start,
-            self._ours_phase_target[frames, 0],
-            self._ours_phase_direction[frames, 0],
-            self._ours_phase_active[frames, 0],
-        )
+        phase_active = self._ours_phase_active[frames, 0]
+        phase_direction = self._ours_phase_direction[frames, 0]
+        phase_target = self._ours_phase_target[frames, 0]
+        if self._ours_progress_mode == "absolute":
+            qpos_start = phase_progress_start_qpos(
+                phase_start,
+                episode_start,
+                self._target_joint_qpos[:, self._ours_active_dof],
+                self._ours_episode_start_qpos,
+            )
+            progress = normalized_phase_progress(
+                active[:, 0], qpos_start, phase_target, phase_direction, phase_active,
+            )
+        else:
+            phase_changed = phase_active & (
+                phase_start != self._ours_progress_phase_start
+            )
+            phase_entry_qpos = torch.where(
+                phase_changed,
+                self._ours_previous_active_qpos,
+                self._ours_progress_phase_entry_qpos,
+            )
+            previous_best = torch.where(
+                phase_changed,
+                torch.zeros_like(self._ours_progress_best),
+                self._ours_progress_best,
+            )
+            reference_start_qpos = self._target_joint_qpos[
+                phase_start, self._ours_active_dof
+            ]
+            relative_progress = phase_relative_progress(
+                active[:, 0],
+                phase_entry_qpos,
+                reference_start_qpos,
+                phase_target,
+                phase_direction,
+                phase_active,
+            )
+            progress, progress_best = incremental_phase_progress(
+                relative_progress, previous_best,
+            )
+            # 静止阶段清空阶段编号；下一个 opening/closing 会重新记录真实入口。
+            self._ours_progress_phase_start = torch.where(
+                phase_active, phase_start, torch.full_like(phase_start, -1),
+            )
+            self._ours_progress_phase_entry_qpos = torch.where(
+                phase_changed, phase_entry_qpos, self._ours_progress_phase_entry_qpos,
+            )
+            self._ours_progress_best = torch.where(
+                phase_active, progress_best, torch.zeros_like(progress_best),
+            )
         residual = self._ours_last_residual if self._ours_last_residual is not None else torch.zeros_like(self._ours_previous_residual)
         acceleration_valid = frames - episode_start > 2
         acceleration_scale = float(self._target_qpos_fps)
@@ -1024,6 +1103,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_previous_dof_velocity = self._dof_vel.detach().clone()
         self._ours_previous_object_linear_velocity = self._target_states[:, 7:10].detach().clone()
         self._ours_previous_object_angular_velocity = self._target_states[:, 10:13].detach().clone()
+        self._ours_previous_active_qpos = active[:, 0].detach().clone()
         self._ours_action_rate_valid[:] = True
         self._ours_reward_count += 1
         values = {"total": reward, **terms}
@@ -1057,9 +1137,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             int(self._ours_reset["required_hand_contact_mismatch_steps"])
         ).any(dim=-1)
 
-        failed = kinematic | contact
-        if self._enable_early_termination:
-            failed |= root_fall
+        # 训练沿用全部失败 reset；fixed-horizon 评测只记录失败，不重置轨迹。
+        failed = (kinematic | contact | root_fall) & self._enable_early_termination
         end_of_motion = frames >= self._ours_ref_root_state.shape[0] - 1
         end_of_rollout = self.progress_buf >= self.max_episode_length - 1
         self._ours_reset_reason_root_fall = root_fall & self._enable_early_termination
@@ -1174,6 +1253,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_episode_start_qpos[env_ids] = self._target_dof_pos[
             env_ids, self._ours_active_dof
         ]
+        self._ours_progress_phase_start[env_ids] = -1
+        self._ours_progress_phase_entry_qpos[env_ids] = self._ours_episode_start_qpos[env_ids]
+        self._ours_progress_best[env_ids] = 0.0
+        self._ours_previous_active_qpos[env_ids] = self._ours_episode_start_qpos[env_ids]
         self._ours_action_rate_valid[env_ids] = False
         self._ours_previous_residual[env_ids] = 0.0
         self._ours_previous_dof_velocity[env_ids] = 0.0

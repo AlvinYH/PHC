@@ -24,7 +24,6 @@ from collections import defaultdict
 
 from poselib.poselib.skeleton.skeleton3d import SkeletonTree, SkeletonMotion, SkeletonState
 from scipy.spatial.transform import Rotation as sRot
-import open3d as o3d
 from datetime import datetime
 import imageio
 from collections import deque
