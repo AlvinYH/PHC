@@ -16,6 +16,11 @@ from phc.env.tasks.humanoid_im_passive_object import HumanoidImPassiveObject
 from phc.learning.network_loader import load_pnn
 from phc.utils.flags import flags
 from phc.utils.isaacgym_torch_utils import quat_apply
+from pipeline.physics.contact import capsule_region_surface_distances_chunked
+from pipeline.physics.finger_segments import (
+    FINGER_SEGMENT_BODY_NAMES,
+    canonical_finger_segment_order,
+)
 from pipeline.physics.ours.observation import OBSERVATION_DIM, build_observation
 from pipeline.physics.ours.policy import (
     compose_residual_action,
@@ -26,7 +31,7 @@ from pipeline.physics.ours.reward import (
     body_contact_indicator,
     build_phase_progress_tables,
     compute_reward,
-    hand_contact_to_body52,
+    finger_object_contact_indicator,
     incremental_phase_progress,
     normalized_phase_progress,
     phase_relative_progress,
@@ -234,6 +239,15 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError(
                 "ours progress mode must be absolute or phase_relative_delta"
             )
+        if not 0.0 < float(self._ours_reward_weights["finger_contact_distance"]):
+            raise ValueError("ours live finger-contact distance must be positive")
+        if float(self._ours_reward_weights["finger_contact_force"]) < 0.0:
+            raise ValueError("ours live finger-contact force threshold must be non-negative")
+        if (
+            float(self._ours_reward_weights["finger_contact_positive_scale"]) < 0.0
+            or float(self._ours_reward_weights["finger_contact_false_positive_scale"]) < 0.0
+        ):
+            raise ValueError("ours finger-contact reward scales must be non-negative")
         if not 0.0 < float(self._ours_reset["termination_height"]):
             raise ValueError("ours termination height must be positive")
         if not 0.0 < float(self._ours_reset["human_key_body_error"]):
@@ -252,6 +266,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "policy_root_bbox", "policy_active_child_bbox",
             "object_surface_mode",
             "collision_surface_points_link_local_scaled", "collision_surface_point_link_names",
+            "finger_contact_surface_points_link_local_scaled",
+            "finger_contact_surface_point_link_names",
+            "finger_contact_body_names", "finger_contact_labels",
             "contact_labels",
         }
         with np.load(self._ours_reference_path, allow_pickle=False) as data:
@@ -523,8 +540,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
 
         body_names = list(self._body_names)
         finger_order = ("Index", "Middle", "Pinky", "Ring", "Thumb")
-        left = [f"L_{finger}{joint}" for finger in finger_order for joint in (1, 2, 3)]
-        right = [f"R_{finger}{joint}" for finger in finger_order for joint in (1, 2, 3)]
+        left = list(FINGER_SEGMENT_BODY_NAMES[:15])
+        right = list(FINGER_SEGMENT_BODY_NAMES[15:])
         tips = [f"{side}_{finger}3" for side in ("L", "R") for finger in finger_order]
         required = ["L_Wrist", "R_Wrist", *left, *right, *tips, "L_Ankle", "L_Toe", "R_Ankle", "R_Toe"]
         missing = [name for name in required if name not in body_names]
@@ -543,16 +560,26 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_feet_ids = self._ours_reward_indices["feet"]
         if not torch.equal(self._ours_finger_ids, self._ours_reward_indices["finger"]):
             raise ValueError("observation and reward finger ordering differ")
-        if self._phc_contact_labels_hand2.shape != (self._target_joint_qpos.shape[0], 2):
-            raise ValueError("Studio PHC contact materialization must retain [T,2] hand labels")
-        self._ours_full_body_contact_labels = hand_contact_to_body52(
-            self._phc_contact_labels_hand2, body_names,
+        ref = self._ours_reference_np
+        reference_finger_names = tuple(
+            str(name) for name in ref["finger_contact_body_names"].reshape(-1)
+        )
+        reference_finger = np.asarray(ref["finger_contact_labels"])
+        if (
+            reference_finger.shape != (self._target_joint_qpos.shape[0], 30)
+            or reference_finger.dtype != np.bool_
+        ):
+            raise ValueError("Studio finger contact labels must be bool [T,30]")
+        reference_finger_order = canonical_finger_segment_order(reference_finger_names)
+        self._ours_finger_contact_reference = torch.tensor(
+            reference_finger[:, reference_finger_order],
+            dtype=torch.bool,
+            device=self.device,
         )
 
         reference_names = [str(name) for name in self._ours_reference_np["body_names"].reshape(-1)]
         if set(reference_names) != set(object_names) or len(reference_names) != len(object_names):
             raise ValueError("Studio reference and PHC object body maps differ")
-        ref = self._ours_reference_np
         reference_order = [reference_names.index(name) for name in object_names]
         self._ours_ref_all_links = torch.tensor(np.concatenate((
             ref["object_link_pos"][:, reference_order],
@@ -575,6 +602,41 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_surface_points_local = torch.tensor(ref["collision_surface_points_link_local_scaled"], dtype=torch.float32, device=self.device)
         self._ours_surface_link_ids = torch.tensor([object_names.index(name) for name in surface_names], dtype=torch.long, device=self.device)
         self._ours_reference_surface = self._ours_world_surface_points(self._ours_ref_all_links)
+        finger_surface_names = [
+            str(name)
+            for name in ref["finger_contact_surface_point_link_names"].reshape(-1)
+        ]
+        if set(finger_surface_names).difference(object_names):
+            raise ValueError("Studio finger contact surface names are absent from the object")
+        if (
+            self._ours_child_link not in set(finger_surface_names)
+            or not set(finger_surface_names).difference({self._ours_child_link})
+        ):
+            raise ValueError("Studio finger contact surface must include active and fixed links")
+        self._ours_finger_surface_points_local = torch.tensor(
+            ref["finger_contact_surface_points_link_local_scaled"],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._ours_finger_surface_link_ids = torch.tensor(
+            [object_names.index(name) for name in finger_surface_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+        finger_ids_cpu = self._ours_finger_ids.detach().cpu().tolist()
+        hand_body_ids = self._phc_hand_body_ids_flat.detach().cpu().tolist()
+        collider_rows = [hand_body_ids.index(int(index)) for index in finger_ids_cpu]
+        self._ours_finger_capsule_endpoints = self._phc_hand_capsule_endpoints_local[
+            collider_rows
+        ]
+        self._ours_finger_capsule_radii = self._phc_hand_capsule_radii[
+            collider_rows
+        ]
+        self._ours_finger_capsule_valid = self._phc_hand_capsule_valid[
+            collider_rows
+        ]
+        if not bool(self._ours_finger_capsule_valid.all()):
+            raise ValueError("Ours requires one capsule collider for every finger segment")
         self._ours_bbox = torch.tensor(
             np.concatenate((ref["policy_root_bbox"], ref["policy_active_child_bbox"]), axis=0),
             dtype=torch.float32,
@@ -933,6 +995,18 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         world = quat_apply(link_state[..., 3:7].reshape(-1, 4), points.reshape(-1, 3)).reshape(object_link_state.shape[0], -1, 3)
         return world + link_state[..., :3]
 
+    def _ours_world_finger_contact_surface(self, object_link_state):
+        link_state = object_link_state.index_select(
+            1, self._ours_finger_surface_link_ids,
+        )
+        points = self._ours_finger_surface_points_local.unsqueeze(0).expand(
+            object_link_state.shape[0], -1, -1,
+        )
+        world = quat_apply(
+            link_state[..., 3:7].reshape(-1, 4), points.reshape(-1, 3),
+        ).reshape(object_link_state.shape[0], -1, 3)
+        return world + link_state[..., :3]
+
     def _compute_reward(self, actions):
         reference, reference_frames = self._ours_reference_motion()
         frames = self._ours_frames()
@@ -943,19 +1017,28 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         active_velocity = self._target_dof_vel[:, self._ours_active_dof:self._ours_active_dof + 1]
         reference_velocity = self._ours_ref_qvel[frames]
         actual_contact = body_contact_indicator(self._contact_forces)
-        reference_contact = self._ours_full_body_contact_labels[frames]
-        region_points = self._target_contact_region_positions()
-        if region_points.ndim != 3 or region_points.shape[1] == 0:
-            raise ValueError("Studio active contact-region geometry is empty")
-        body_region_distance = torch.cdist(self._rigid_body_pos, region_points).amin(dim=-1)
         current_links = self._rigid_body_state_reshaped[:, self._ours_all_object_ids]
         current_surface = self._ours_world_surface_points(current_links)
-        left_ids = self._ours_reward_indices["left_hand"]
-        right_ids = self._ours_reward_indices["right_hand"]
-        hand_region_distance = torch.stack((
-            body_region_distance.index_select(1, left_ids).amin(dim=-1),
-            body_region_distance.index_select(1, right_ids).amin(dim=-1),
-        ), dim=-1)
+        full_object_surface = self._ours_world_finger_contact_surface(current_links)
+        finger_state = self._rigid_body_state_reshaped[:, self._ours_finger_ids]
+        finger_object_distance = capsule_region_surface_distances_chunked(
+            body_pos=finger_state[..., :3],
+            body_quat_xyzw=finger_state[..., 3:7],
+            endpoints_local=self._ours_finger_capsule_endpoints,
+            radii=self._ours_finger_capsule_radii,
+            valid=self._ours_finger_capsule_valid,
+            region_points=full_object_surface,
+        )
+        finger_force = self._contact_forces.index_select(1, self._ours_finger_ids)
+        reference_finger_contact = self._ours_finger_contact_reference[frames]
+        live_finger_contact = finger_object_contact_indicator(
+            finger_object_distance,
+            finger_force,
+            distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
+            force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
+        )
+        self._ours_finger_object_distance = finger_object_distance
+        self._ours_live_finger_contact = live_finger_contact
         episode_start = self._ours_episode_start_frames
         phase_start = self._ours_phase_start[frames, 0]
         phase_active = self._ours_phase_active[frames, 0]
@@ -1034,10 +1117,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             },
             contact={
                 "body_contact": actual_contact,
-                "reference_body_contact": reference_contact,
-                "hand_region_distance": hand_region_distance,
-                "body_region_distance": body_region_distance,
                 "contact_force": self._contact_forces,
+                "reference_finger_contact": reference_finger_contact,
+                "finger_object_distance": finger_object_distance,
+                "finger_contact_force": finger_force,
             },
             articulation={
                 "active_qpos": active,
@@ -1060,36 +1143,26 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             weights=self._ours_reward_weights,
         )
         self.rew_buf[:] = reward
-        self._ours_required_hand_contact = torch.stack(tuple(
-            reference_contact.index_select(1, self._ours_reward_indices[side]).gt(0.1).any(dim=-1)
-            for side in ("left_hand", "right_hand")
-        ), dim=-1)
-        self._ours_live_hand_contact = torch.stack(tuple(
-            actual_contact.index_select(1, self._ours_reward_indices[side]).gt(0.1).any(dim=-1)
-            for side in ("left_hand", "right_hand")
-        ), dim=-1)
-        part_distance = float(self._ours_reward_weights["part_contact_distance"])
-        self._ours_live_hand_region_contact = torch.stack(tuple(
-            (
-                actual_contact.index_select(1, self._ours_reward_indices[side]).gt(0.1)
-                & body_region_distance.index_select(
-                    1, self._ours_reward_indices[side]
-                ).lt(part_distance)
-            ).any(dim=-1)
-            for side in ("left_hand", "right_hand")
-        ), dim=-1)
+        self._ours_required_hand_contact = reference_finger_contact.reshape(
+            self.num_envs, 2, 15,
+        ).any(dim=-1)
+        self._ours_live_hand_region_contact = live_finger_contact.reshape(
+            self.num_envs, 2, 15,
+        ).any(dim=-1)
+        self._ours_live_hand_contact = self._ours_live_hand_region_contact
         self._ours_human_reset, self._ours_object_reset, self._ours_contact_reset = reward_reset_signals(
             self._rigid_body_pos,
             reference["rg_pos"],
             current_surface,
             self._ours_reference_surface[frames],
             actual_contact,
-            reference_contact,
+            torch.zeros_like(actual_contact),
             self._ours_reward_indices,
             self._ours_contact_reset,
             float(self._ours_reset["human_key_body_error"]),
             float(self._ours_reset["object_surface_error"]),
             live_hand_contact=self._ours_live_hand_region_contact,
+            reference_hand_contact=self._ours_required_hand_contact,
         )
         if (
             self._ours_closed_loop_trace_path is not None
@@ -1485,25 +1558,26 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         rollout = self.extras["physics_rollout"]
         frames = self._ours_reference_lookup_frames
         finger_ids = self._ours_reward_indices["finger"]
-        region_points = self._target_contact_region_positions()
-        finger_distance = torch.cdist(self._rigid_body_pos.index_select(1, finger_ids), region_points).amin(dim=-1)
         force_components = self._contact_forces.index_select(1, finger_ids)
         force = torch.linalg.norm(force_components, dim=-1)
-        contact = (force_components.abs() > 0.1).any(dim=-1)
+        contact = self._ours_live_finger_contact
         reference_body_state = torch.cat((
             self._ours_reference["rg_pos"],
             self._ours_reference["rb_rot"],
             self._ours_reference["body_vel"],
             self._ours_reference["body_ang_vel"],
         ), dim=-1)
-        distance = float(self._ours_reward_weights["part_contact_distance"])
         rollout["ours_evaluation"] = {
+            "reference_frame": frames.detach().cpu().numpy(),
             "reference_body_state": reference_body_state.detach().cpu().numpy(),
-            "finger_reference_contact": self._ours_full_body_contact_labels[frames].index_select(1, finger_ids).detach().cpu().numpy(),
+            "finger_reference_contact": self._ours_finger_contact_reference[frames].detach().cpu().numpy(),
             "finger_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             "finger_contact_force": force.detach().cpu().numpy(),
-            "finger_handle_distance": finger_distance.detach().cpu().numpy(),
-            "finger_handle_contact": (contact & (finger_distance < distance)).to(dtype=force.dtype).detach().cpu().numpy(),
+            "finger_object_distance": self._ours_finger_object_distance.detach().cpu().numpy(),
+            "finger_object_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
+            # 兼容旧分析器字段名；语义已升级为 full-object，而不是 handle-only。
+            "finger_handle_distance": self._ours_finger_object_distance.detach().cpu().numpy(),
+            "finger_handle_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             "hinge_phase_active": self._ours_phase_active[frames].detach().cpu().numpy(),
         }
 
