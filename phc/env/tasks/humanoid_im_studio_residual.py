@@ -243,11 +243,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("ours live finger-contact distance must be positive")
         if float(self._ours_reward_weights["finger_contact_force"]) < 0.0:
             raise ValueError("ours live finger-contact force threshold must be non-negative")
-        if (
-            float(self._ours_reward_weights["finger_contact_positive_scale"]) < 0.0
-            or float(self._ours_reward_weights["finger_contact_false_positive_scale"]) < 0.0
-        ):
-            raise ValueError("ours finger-contact reward scales must be non-negative")
         if not 0.0 < float(self._ours_reset["termination_height"]):
             raise ValueError("ours termination height must be positive")
         if not 0.0 < float(self._ours_reset["human_key_body_error"]):
@@ -1031,6 +1026,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
         finger_force = self._contact_forces.index_select(1, self._ours_finger_ids)
         reference_finger_contact = self._ours_finger_contact_reference[frames]
+        reference_hand_contact = self._phc_contact_labels_hand2[frames].bool()
         live_finger_contact = finger_object_contact_indicator(
             finger_object_distance,
             finger_force,
@@ -1116,8 +1112,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "angular_acceleration": (self._target_states[:, 10:13] - self._ours_previous_object_angular_velocity) * acceleration_scale,
             },
             contact={
-                "body_contact": actual_contact,
-                "contact_force": self._contact_forces,
+                "reference_hand_contact": reference_hand_contact,
                 "reference_finger_contact": reference_finger_contact,
                 "finger_object_distance": finger_object_distance,
                 "finger_contact_force": finger_force,
@@ -1143,9 +1138,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             weights=self._ours_reward_weights,
         )
         self.rew_buf[:] = reward
-        self._ours_required_hand_contact = reference_finger_contact.reshape(
-            self.num_envs, 2, 15,
-        ).any(dim=-1)
+        self._ours_required_hand_contact = reference_hand_contact
         self._ours_live_hand_region_contact = live_finger_contact.reshape(
             self.num_envs, 2, 15,
         ).any(dim=-1)
