@@ -1069,11 +1069,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_previous_active_qpos,
             self._ours_progress_phase_entry_qpos,
         )
-        previous_best = torch.where(
-            phase_changed,
-            torch.zeros_like(self._ours_progress_best),
-            self._ours_progress_best,
-        )
         reference_start_qpos = self._target_joint_qpos[
             phase_start, self._ours_active_dof
         ]
