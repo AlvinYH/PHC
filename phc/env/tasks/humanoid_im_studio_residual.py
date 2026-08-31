@@ -37,6 +37,7 @@ from pipeline.physics.ours.reward import (
     phase_prerequisite_transition,
     reward_body_indices,
     reward_reset_signals,
+    whole_hand_object_distance,
 )
 
 
@@ -74,6 +75,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
         self._ours_progress_prerequisite_threshold = float(
             self._ours_reward_weights.pop("progress_prerequisite_threshold", 0.5)
+        )
+        self._ours_progress_target_cap_scale = float(
+            self._ours_reward_weights.pop("progress_target_cap_scale", 1.0)
         )
         self._ours_reset = dict(env["oursReset"])
         self._ours_residual_scale = float(env["oursResidualScale"])
@@ -246,12 +250,25 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("ours progress prerequisite mode must be previous or all")
         if not 0.0 < self._ours_progress_prerequisite_threshold <= 1.0:
             raise ValueError("ours progress prerequisite threshold must be in (0,1]")
+        if not np.isfinite(self._ours_progress_target_cap_scale) or (
+            self._ours_progress_target_cap_scale <= 0.0
+        ):
+            raise ValueError("ours progress_target_cap_scale must be positive and finite")
         if not 0.0 <= float(self._ours_reward_weights["progress_contact_base"]) <= 1.0:
             raise ValueError("ours progress contact base must be in [0,1]")
         if not 0.0 < float(self._ours_reward_weights["finger_contact_distance"]):
             raise ValueError("ours live finger-contact distance must be positive")
         if float(self._ours_reward_weights["finger_contact_force"]) < 0.0:
             raise ValueError("ours live finger-contact force threshold must be non-negative")
+        for name in (
+            "contact_binary_reward_enabled", "contact_distance_reward_enabled",
+            "coarse_contact_reward_enabled", "fine_contact_reward_enabled",
+        ):
+            if not isinstance(self._ours_reward_weights[name], bool):
+                raise ValueError(f"ours {name} must be boolean")
+        for name in ("coarse_contact_distance_weight", "fine_contact_distance_weight"):
+            if float(self._ours_reward_weights[name]) < 0.0:
+                raise ValueError(f"ours {name} must be non-negative")
         if not 0.0 < float(self._ours_reset["termination_height"]):
             raise ValueError("ours termination height must be positive")
         if not 0.0 < float(self._ours_reset["human_key_body_error"]):
@@ -697,6 +714,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_previous_dof_velocity = torch.zeros_like(self._dof_vel)
         self._ours_previous_object_linear_velocity = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
         self._ours_previous_object_angular_velocity = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self._ours_previous_active_link_linear_velocity = torch.zeros(
+            (self.num_envs, 3), dtype=torch.float32, device=self.device,
+        )
+        self._ours_previous_active_link_angular_velocity = torch.zeros_like(
+            self._ours_previous_active_link_linear_velocity,
+        )
         self._ours_action_rate_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._ours_human_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._ours_object_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1040,6 +1063,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             valid=self._ours_finger_capsule_valid,
             region_points=full_object_surface,
         )
+        # Coarse hand reward 也只由同侧手指距离聚合，避免用手腕碰撞体蹭取奖励。
+        hand_object_distance = whole_hand_object_distance(finger_object_distance)
         finger_force = self._contact_forces.index_select(1, self._ours_finger_ids)
         reference_finger_contact = self._ours_finger_contact_reference[frames]
         reference_hand_contact = self._phc_contact_labels_hand2[frames].bool()
@@ -1050,6 +1075,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
         )
         self._ours_finger_object_distance = finger_object_distance
+        self._ours_hand_object_distance = hand_object_distance
         self._ours_live_finger_contact = live_finger_contact
         episode_start = self._ours_episode_start_frames
         phase_start = self._ours_phase_start[frames, 0]
@@ -1075,6 +1101,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             phase_target,
             phase_direction,
             phase_active,
+            target_cap_scale=self._ours_progress_target_cap_scale,
         )
         # 新阶段入口只看上一阶段在切换时的实际完成度，不记录历史最大值。
         previous_phase_index = self._ours_progress_phase_start.clamp_min(0)
@@ -1107,6 +1134,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         residual = self._ours_last_residual if self._ours_last_residual is not None else torch.zeros_like(self._ours_previous_residual)
         acceleration_valid = frames - episode_start > 2
         acceleration_scale = float(self._target_qpos_fps)
+        active_link_state = current_links[:, self._ours_child_object_index]
+        reference_active_link_state = self._ours_ref_all_links[
+            frames, self._ours_child_object_index
+        ]
         reward, terms = compute_reward(
             human={
                 "body_pos": self._rigid_body_pos,
@@ -1126,10 +1157,22 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "reference_root_state": self._ours_ref_root_state[frames],
                 "linear_acceleration": (self._target_states[:, 7:10] - self._ours_previous_object_linear_velocity) * acceleration_scale,
                 "angular_acceleration": (self._target_states[:, 10:13] - self._ours_previous_object_angular_velocity) * acceleration_scale,
+                "active_link_state": active_link_state,
+                "reference_active_link_state": reference_active_link_state,
+                # active child 的平滑项只使用 live PhysX 速度，不从 noisy reference 求二阶差分。
+                "active_link_linear_acceleration": (
+                    active_link_state[:, 7:10]
+                    - self._ours_previous_active_link_linear_velocity
+                ) * acceleration_scale,
+                "active_link_angular_acceleration": (
+                    active_link_state[:, 10:13]
+                    - self._ours_previous_active_link_angular_velocity
+                ) * acceleration_scale,
             },
             contact={
                 "reference_hand_contact": reference_hand_contact,
                 "reference_finger_contact": reference_finger_contact,
+                "hand_object_distance": hand_object_distance,
                 "finger_object_distance": finger_object_distance,
                 "finger_contact_force": finger_force,
             },
@@ -1186,6 +1229,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_previous_dof_velocity = self._dof_vel.detach().clone()
         self._ours_previous_object_linear_velocity = self._target_states[:, 7:10].detach().clone()
         self._ours_previous_object_angular_velocity = self._target_states[:, 10:13].detach().clone()
+        self._ours_previous_active_link_linear_velocity = (
+            active_link_state[:, 7:10].detach().clone()
+        )
+        self._ours_previous_active_link_angular_velocity = (
+            active_link_state[:, 10:13].detach().clone()
+        )
         self._ours_previous_active_qpos = active[:, 0].detach().clone()
         self._ours_action_rate_valid[:] = True
         self._ours_reward_count += 1
@@ -1216,7 +1265,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_human_reset
             | self._ours_object_reset
         )
-        contact = started & self._ours_contact_reset.gt(
+        contact = started & self._ours_contact_reset.ge(
             int(self._ours_reset["required_hand_contact_mismatch_steps"])
         ).any(dim=-1)
 
@@ -1253,7 +1302,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             signals["live_region_" + side] = live_region
             signals["missing_region_" + side] = required & ~live_region
             signals["reset_live_" + side] = live_region
-            signals["contact_" + side] = started & self._ours_contact_reset[:, index].gt(
+            signals["contact_" + side] = started & self._ours_contact_reset[:, index].ge(
                 int(self._ours_reset["required_hand_contact_mismatch_steps"])
             )
         for name, signal in signals.items():
@@ -1346,6 +1395,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_previous_dof_velocity[env_ids] = 0.0
         self._ours_previous_object_linear_velocity[env_ids] = 0.0
         self._ours_previous_object_angular_velocity[env_ids] = 0.0
+        self._ours_previous_active_link_linear_velocity[env_ids] = 0.0
+        self._ours_previous_active_link_angular_velocity[env_ids] = 0.0
         self._ours_human_reset[env_ids] = False
         self._ours_object_reset[env_ids] = False
         self._ours_contact_reset[env_ids] = 0.0
@@ -1585,6 +1636,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "finger_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             "finger_contact_force": force.detach().cpu().numpy(),
             "finger_object_distance": self._ours_finger_object_distance.detach().cpu().numpy(),
+            "hand_object_distance": self._ours_hand_object_distance.detach().cpu().numpy(),
             "finger_object_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             # 兼容旧分析器字段名；语义已升级为 full-object，而不是 handle-only。
             "finger_handle_distance": self._ours_finger_object_distance.detach().cpu().numpy(),
