@@ -16,7 +16,7 @@ from phc.env.tasks.humanoid_im_passive_object import HumanoidImPassiveObject
 from phc.learning.network_loader import load_pnn
 from phc.utils.flags import flags
 from phc.utils.isaacgym_torch_utils import quat_apply
-from pipeline.physics.contact import capsule_region_surface_distances_chunked
+from pipeline.physics.contact import joint_region_surface_distances_chunked
 from pipeline.physics.finger_segments import (
     FINGER_SEGMENT_BODY_NAMES,
     canonical_finger_segment_order,
@@ -644,20 +644,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dtype=torch.long,
             device=self.device,
         )
-        finger_ids_cpu = self._ours_finger_ids.detach().cpu().tolist()
-        hand_body_ids = self._phc_hand_body_ids_flat.detach().cpu().tolist()
-        collider_rows = [hand_body_ids.index(int(index)) for index in finger_ids_cpu]
-        self._ours_finger_capsule_endpoints = self._phc_hand_capsule_endpoints_local[
-            collider_rows
-        ]
-        self._ours_finger_capsule_radii = self._phc_hand_capsule_radii[
-            collider_rows
-        ]
-        self._ours_finger_capsule_valid = self._phc_hand_capsule_valid[
-            collider_rows
-        ]
-        if not bool(self._ours_finger_capsule_valid.all()):
-            raise ValueError("Ours requires one capsule collider for every finger segment")
         self._ours_bbox = torch.tensor(
             np.concatenate((ref["policy_root_bbox"], ref["policy_active_child_bbox"]), axis=0),
             dtype=torch.float32,
@@ -1055,13 +1041,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         current_surface = self._ours_world_surface_points(current_links)
         full_object_surface = self._ours_world_finger_contact_surface(current_links)
         finger_state = self._rigid_body_state_reshaped[:, self._ours_finger_ids]
-        finger_object_distance = capsule_region_surface_distances_chunked(
-            body_pos=finger_state[..., :3],
-            body_quat_xyzw=finger_state[..., 3:7],
-            endpoints_local=self._ours_finger_capsule_endpoints,
-            radii=self._ours_finger_capsule_radii,
-            valid=self._ours_finger_capsule_valid,
-            region_points=full_object_surface,
+        finger_object_distance = joint_region_surface_distances_chunked(
+            finger_state[..., :3], full_object_surface,
         )
         # Coarse hand reward 也只由同侧手指距离聚合，避免用手腕碰撞体蹭取奖励。
         hand_object_distance = whole_hand_object_distance(finger_object_distance)
