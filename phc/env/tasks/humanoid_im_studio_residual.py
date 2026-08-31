@@ -33,7 +33,6 @@ from pipeline.physics.ours.reward import (
     build_phase_progress_tables,
     compute_reward,
     finger_object_contact_indicator,
-    incremental_phase_progress,
     phase_relative_progress,
     phase_prerequisite_transition,
     reward_body_indices,
@@ -68,7 +67,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_reference_path = Path(env["oursReferencePath"]).expanduser()
         self._ours_reward_weights = dict(env["oursReward"])
         self._ours_progress_mode = str(
-            self._ours_reward_weights.pop("progress_mode", "phase_relative_delta")
+            self._ours_reward_weights.pop("progress_mode", "phase_relative_completion")
         )
         self._ours_progress_prerequisite_mode = str(
             self._ours_reward_weights.pop("progress_prerequisite_mode", "previous")
@@ -241,8 +240,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("diagnostic teacher frame offset must be 0 or 1")
         if self._ours_reward_weights["ig"] != 0.0 or self._ours_reward_weights["handle_normal"] != 0.0:
             raise ValueError("baseline requires neutral IG and handle-normal")
-        if self._ours_progress_mode != "phase_relative_delta":
-            raise ValueError("ours progress mode must be phase_relative_delta")
+        if self._ours_progress_mode != "phase_relative_completion":
+            raise ValueError("ours progress mode must be phase_relative_completion")
         if self._ours_progress_prerequisite_mode not in ("previous", "all"):
             raise ValueError("ours progress prerequisite mode must be previous or all")
         if not 0.0 < self._ours_progress_prerequisite_threshold <= 1.0:
@@ -687,9 +686,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             (self.num_envs,), -1, dtype=torch.long, device=self.device,
         )
         self._ours_progress_phase_entry_qpos = self._ours_episode_start_qpos.clone()
-        self._ours_progress_best = torch.zeros(
-            self.num_envs, dtype=torch.float32, device=self.device,
-        )
         self._ours_progress_gate_open = torch.ones(
             self.num_envs, dtype=torch.bool, device=self.device,
         )
@@ -1072,7 +1068,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         reference_start_qpos = self._target_joint_qpos[
             phase_start, self._ours_active_dof
         ]
-        relative_progress = phase_relative_progress(
+        phase_completion = phase_relative_progress(
             active[:, 0],
             phase_entry_qpos,
             reference_start_qpos,
@@ -1080,24 +1076,32 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             phase_direction,
             phase_active,
         )
-        gate, phase_id, phase_best, all_previous_passed, _ = (
+        # 新阶段入口只看上一阶段在切换时的实际完成度，不记录历史最大值。
+        previous_phase_index = self._ours_progress_phase_start.clamp_min(0)
+        previous_phase_completion = phase_relative_progress(
+            self._ours_previous_active_qpos,
+            self._ours_progress_phase_entry_qpos,
+            self._target_joint_qpos[
+                previous_phase_index, self._ours_active_dof
+            ],
+            self._ours_phase_target[previous_phase_index, 0],
+            self._ours_phase_direction[previous_phase_index, 0],
+            self._ours_progress_phase_start >= 0,
+        )
+        gate, phase_id, all_previous_passed, _ = (
             phase_prerequisite_transition(
                 phase_start, phase_predecessor, phase_active,
-                self._ours_progress_phase_start, self._ours_progress_best,
+                self._ours_progress_phase_start, previous_phase_completion,
                 self._ours_progress_gate_open,
                 self._ours_progress_all_previous_passed,
                 mode=self._ours_progress_prerequisite_mode,
                 threshold=self._ours_progress_prerequisite_threshold,
             )
         )
-        angular_progress, progress_best = incremental_phase_progress(
-            relative_progress, phase_best,
-        )
         self._ours_progress_phase_start = phase_id
         self._ours_progress_phase_entry_qpos = torch.where(
             phase_changed, phase_entry_qpos, self._ours_progress_phase_entry_qpos,
         )
-        self._ours_progress_best = progress_best
         self._ours_progress_gate_open = gate
         self._ours_progress_all_previous_passed = all_previous_passed
         residual = self._ours_last_residual if self._ours_last_residual is not None else torch.zeros_like(self._ours_previous_residual)
@@ -1134,7 +1138,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "reference_active_qpos": active_reference,
                 "active_qvel": active_velocity,
                 "reference_active_qvel": reference_velocity,
-                "active_progress": angular_progress,
+                "active_progress": phase_completion,
                 "progress_gate_open": gate & phase_active,
             },
             regularization={
@@ -1334,7 +1338,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ]
         self._ours_progress_phase_start[env_ids] = -1
         self._ours_progress_phase_entry_qpos[env_ids] = self._ours_episode_start_qpos[env_ids]
-        self._ours_progress_best[env_ids] = 0.0
         self._ours_progress_gate_open[env_ids] = True
         self._ours_progress_all_previous_passed[env_ids] = True
         self._ours_previous_active_qpos[env_ids] = self._ours_episode_start_qpos[env_ids]
