@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from phc.env.tasks.humanoid_im import HumanoidIm
+from phc.env.tasks.humanoid_amp import HumanoidAMP
 from phc.utils.flags import flags
 
 
@@ -126,7 +127,6 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._target_asset_body_count = 0
         self._target_max_dof = 0
         self._target_joint_qpos = None
-        self._target_initial_joint_qpos = None
         self._target_last_reset_joint_qpos = None
         self._target_last_reset_reference_frame = None
         self._phc_reset_human_root_state = None
@@ -691,24 +691,6 @@ class HumanoidImPassiveObject(HumanoidIm):
         full_qpos[:, dof_indices] = qpos_np
         self._target_active_dof_indices = torch.tensor(dof_indices, dtype=torch.long, device=self.device)
         self._target_joint_qpos = torch.tensor(full_qpos, dtype=torch.float32, device=self.device)
-        initial_qpos = np.asarray(
-            self._phc_object_config["initial_joint_qpos"],
-            dtype=np.float32,
-        ).reshape(-1)
-        if initial_qpos.shape[0] != len(reference_joint_names):
-            raise ValueError(
-                "initial_joint_qpos length does not match articulated_target_joint_names: "
-                f"qpos={initial_qpos.shape[0]}, joints={len(reference_joint_names)}"
-            )
-        if not np.isfinite(initial_qpos).all():
-            raise ValueError("initial_joint_qpos contains non-finite values")
-        full_initial_qpos = np.zeros((self._target_max_dof,), dtype=np.float32)
-        full_initial_qpos[dof_indices] = initial_qpos
-        self._target_initial_joint_qpos = torch.tensor(
-            full_initial_qpos,
-            dtype=torch.float32,
-            device=self.device,
-        )
 
     def _sample_time(self, motion_ids):
         if self._phc_eval_start_frame is not None:
@@ -744,12 +726,15 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._write_target_reset_joint_qpos(env_ids)
 
     def _write_target_reset_joint_qpos(self, env_ids):
-        """Reset every object joint to the case-defined physical initial state."""
+        """Reset from the one full q trajectory shared by every backend."""
 
-        if self._target_initial_joint_qpos is None:
-            raise RuntimeError("Missing case-level target initial joint qpos")
         frames = self._target_frame_indices(env_ids)
-        reset_qpos = self._target_initial_joint_qpos.expand(len(env_ids), -1)
+        if self._state_init in {
+            HumanoidAMP.StateInit.Default,
+            HumanoidAMP.StateInit.Start,
+        }:
+            frames = torch.zeros_like(frames)
+        reset_qpos = self._target_qpos_ref_for_frames(frames)
         self._target_dof_pos[env_ids, :] = reset_qpos
         self._target_dof_vel[env_ids, :] = 0.0
         if self._target_last_reset_joint_qpos is None:
