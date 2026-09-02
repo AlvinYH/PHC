@@ -35,6 +35,7 @@ from pipeline.physics.ours.reward import (
     finger_object_contact_indicator,
     phase_relative_progress,
     phase_prerequisite_transition,
+    reference_paced_progress,
     reward_body_indices,
     reward_reset_signals,
     whole_hand_object_distance,
@@ -120,6 +121,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_closed_loop_pending = None
         self._ours_last_reward_terms = None
         self._ours_reward_sum = {}
+        self._ours_reward_min = {}
+        self._ours_reward_max = {}
+        self._ours_peak_progress = None
+        self._ours_hinge_q_at_peak_progress = None
         self._ours_reward_count = 0
         self._ours_last_residual = None
         self._ours_outputs_finalized = False
@@ -244,8 +249,14 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("diagnostic teacher frame offset must be 0 or 1")
         if self._ours_reward_weights["ig"] != 0.0 or self._ours_reward_weights["handle_normal"] != 0.0:
             raise ValueError("baseline requires neutral IG and handle-normal")
-        if self._ours_progress_mode != "phase_relative_completion":
-            raise ValueError("ours progress mode must be phase_relative_completion")
+        if self._ours_progress_mode not in (
+            "phase_relative_completion",
+            "reference_paced_completion",
+        ):
+            raise ValueError(
+                "ours progress mode must be phase_relative_completion or "
+                "reference_paced_completion"
+            )
         if self._ours_progress_prerequisite_mode not in ("previous", "all"):
             raise ValueError("ours progress prerequisite mode must be previous or all")
         if not 0.0 < self._ours_progress_prerequisite_threshold <= 1.0:
@@ -260,6 +271,28 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("ours live finger-contact distance must be positive")
         if float(self._ours_reward_weights["finger_contact_force"]) < 0.0:
             raise ValueError("ours live finger-contact force threshold must be non-negative")
+        progress_overshoot_penalty = float(
+            self._ours_reward_weights.get("progress_overshoot_penalty", 0.0)
+        )
+        if not np.isfinite(progress_overshoot_penalty):
+            raise ValueError("ours progress overshoot penalty must be finite")
+        if progress_overshoot_penalty < 0.0:
+            raise ValueError("ours progress overshoot penalty must be non-negative")
+        progress_penalty_enabled = self._ours_reward_weights.get(
+            "progress_overshoot_penalty_enabled", False,
+        )
+        if not isinstance(progress_penalty_enabled, bool):
+            raise ValueError(
+                "ours progress overshoot penalty switch must be boolean"
+            )
+        if (
+            progress_penalty_enabled
+            and self._ours_progress_mode != "reference_paced_completion"
+        ):
+            raise ValueError(
+                "ours progress overshoot penalty requires "
+                "reference_paced_completion"
+            )
         for name in (
             "contact_binary_reward_enabled", "contact_distance_reward_enabled",
             "coarse_contact_reward_enabled", "fine_contact_reward_enabled",
@@ -1085,6 +1118,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             target_cap_scale=self._ours_progress_target_cap_scale,
         )
         # 新阶段入口只看上一阶段在切换时的实际完成度，不记录历史最大值。
+        # cap 只扩展当前阶段的 reward；前序门始终按 canonical [0,1] 完成率判断，
+        # 避免超过 GT 终点的 overshoot 被用来补足未完成的 reference 行程。
         previous_phase_index = self._ours_progress_phase_start.clamp_min(0)
         previous_phase_completion = phase_relative_progress(
             self._ours_previous_active_qpos,
@@ -1095,6 +1130,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_phase_target[previous_phase_index, 0],
             self._ours_phase_direction[previous_phase_index, 0],
             self._ours_progress_phase_start >= 0,
+            target_cap_scale=1.0,
         )
         gate, phase_id, all_previous_passed, _ = (
             phase_prerequisite_transition(
@@ -1112,6 +1148,20 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
         self._ours_progress_gate_open = gate
         self._ours_progress_all_previous_passed = all_previous_passed
+        progress_gate = gate & phase_active
+        progress_bonus = phase_completion
+        progress_overshoot = torch.zeros_like(phase_completion)
+        if self._ours_progress_mode == "reference_paced_completion":
+            progress_bonus, progress_overshoot = reference_paced_progress(
+                phase_completion,
+                active[:, 0],
+                phase_entry_qpos,
+                active_reference[:, 0],
+                reference_start_qpos,
+                phase_target,
+                phase_direction,
+                phase_active,
+            )
         residual = self._ours_last_residual if self._ours_last_residual is not None else torch.zeros_like(self._ours_previous_residual)
         acceleration_valid = frames - episode_start > 2
         acceleration_scale = float(self._target_qpos_fps)
@@ -1163,7 +1213,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "active_qvel": active_velocity,
                 "reference_active_qvel": reference_velocity,
                 "active_progress": phase_completion,
-                "progress_gate_open": gate & phase_active,
+                "active_progress_bonus": progress_bonus,
+                "active_progress_overshoot": progress_overshoot,
+                "progress_gate_open": progress_gate,
             },
             regularization={
                 "feet_velocity_xy": self._rigid_body_vel[:, self._ours_feet_ids, :2],
@@ -1220,10 +1272,47 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_action_rate_valid[:] = True
         self._ours_reward_count += 1
         values = {"total": reward, **terms}
+        ranged_names = {
+            "active_hinge_q",
+            "reference_hinge_q",
+            "active_hinge_q_error",
+            "progress_metric",
+        }
         for name, value in values.items():
             if name not in self._ours_reward_sum:
                 self._ours_reward_sum[name] = torch.zeros((), device=self.device)
             self._ours_reward_sum[name] += value.detach().mean()
+            if name not in ranged_names:
+                continue
+            if name not in self._ours_reward_min:
+                self._ours_reward_min[name] = torch.full(
+                    (), float("inf"), device=self.device,
+                )
+                self._ours_reward_max[name] = torch.full(
+                    (), float("-inf"), device=self.device,
+                )
+            self._ours_reward_min[name] = torch.minimum(
+                self._ours_reward_min[name], value.detach().amin(),
+            )
+            self._ours_reward_max[name] = torch.maximum(
+                self._ours_reward_max[name], value.detach().amax(),
+            )
+        progress = terms["progress_metric"].detach().reshape(-1)
+        peak_progress, peak_index = progress.max(dim=0)
+        peak_q = terms["active_hinge_q"].detach().reshape(-1).gather(
+            0, peak_index.reshape(1),
+        )[0]
+        if self._ours_peak_progress is None:
+            self._ours_peak_progress = peak_progress
+            self._ours_hinge_q_at_peak_progress = peak_q
+        else:
+            improved = peak_progress > self._ours_peak_progress
+            self._ours_peak_progress = torch.where(
+                improved, peak_progress, self._ours_peak_progress,
+            )
+            self._ours_hinge_q_at_peak_progress = torch.where(
+                improved, peak_q, self._ours_hinge_q_at_peak_progress,
+            )
 
     def _compute_reset(self):
         if not hasattr(self, "_ours_pnn"):
@@ -1311,8 +1400,27 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         names = tuple(self._ours_reward_sum)
         values = torch.stack(tuple(self._ours_reward_sum[name] for name in names)) / self._ours_reward_count
         result = dict(zip(names, values.cpu().tolist()))
+        for name in (
+            "active_hinge_q",
+            "reference_hinge_q",
+            "active_hinge_q_error",
+            "progress_metric",
+        ):
+            if name not in self._ours_reward_min:
+                continue
+            result[name + "_min"] = float(self._ours_reward_min[name].cpu())
+            result[name + "_max"] = float(self._ours_reward_max[name].cpu())
+        if self._ours_peak_progress is not None:
+            result["progress_metric_peak"] = float(self._ours_peak_progress.cpu())
+            result["hinge_q_at_peak_progress"] = float(
+                self._ours_hinge_q_at_peak_progress.cpu()
+            )
         if clear:
             self._ours_reward_sum.clear()
+            self._ours_reward_min.clear()
+            self._ours_reward_max.clear()
+            self._ours_peak_progress = None
+            self._ours_hinge_q_at_peak_progress = None
             self._ours_reward_count = 0
         return result
 
