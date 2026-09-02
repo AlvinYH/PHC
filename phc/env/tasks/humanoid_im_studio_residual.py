@@ -80,6 +80,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_progress_target_cap_scale = float(
             self._ours_reward_weights.pop("progress_target_cap_scale", 1.0)
         )
+        self._ours_progress_lead_tolerance = float(
+            self._ours_reward_weights.pop("progress_lead_tolerance", 0.0)
+        )
         self._ours_reset = dict(env["oursReset"])
         self._ours_residual_scale = float(env["oursResidualScale"])
         self._ours_teacher_frame_offset = int(env.get("oursTeacherFrameOffset", 0))
@@ -265,8 +268,19 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_progress_target_cap_scale <= 0.0
         ):
             raise ValueError("ours progress_target_cap_scale must be positive and finite")
+        if not np.isfinite(self._ours_progress_lead_tolerance) or not (
+            0.0 <= self._ours_progress_lead_tolerance <= 1.0
+        ):
+            raise ValueError(
+                "ours progress lead tolerance must be finite and in [0,1]"
+            )
         if not 0.0 <= float(self._ours_reward_weights["progress_contact_base"]) <= 1.0:
             raise ValueError("ours progress contact base must be in [0,1]")
+        progress_weight = float(self._ours_reward_weights["progress"])
+        if not np.isfinite(progress_weight) or progress_weight < 0.0:
+            raise ValueError(
+                "ours progress reward weight must be non-negative and finite"
+            )
         if not 0.0 < float(self._ours_reward_weights["finger_contact_distance"]):
             raise ValueError("ours live finger-contact distance must be positive")
         if float(self._ours_reward_weights["finger_contact_force"]) < 0.0:
@@ -292,6 +306,13 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError(
                 "ours progress overshoot penalty requires "
                 "reference_paced_completion"
+            )
+        if (
+            progress_penalty_enabled
+            and "progress_overshoot_penalty" not in self._ours_reward_weights
+        ):
+            raise ValueError(
+                "enabled progress overshoot penalty requires its weight"
             )
         for name in (
             "contact_binary_reward_enabled", "contact_distance_reward_enabled",
@@ -1097,8 +1118,30 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         phase_direction = self._ours_phase_direction[frames, 0]
         phase_target = self._ours_phase_target[frames, 0]
         phase_predecessor = self._ours_phase_predecessor[frames, 0]
-        phase_changed = phase_active & (
-            phase_start != self._ours_progress_phase_start
+        # 新阶段入口只看上一阶段在切换时的实际完成度，不记录历史最大值。
+        # cap 只扩展当前阶段的 reward；前序门始终按 canonical [0,1] 完成率判断，
+        # 避免超过 GT 终点的 overshoot 被用来补足未完成的 reference 行程。
+        previous_phase_index = self._ours_progress_phase_start.clamp_min(0)
+        previous_phase_completion = phase_relative_progress(
+            self._ours_previous_active_qpos,
+            self._ours_progress_phase_entry_qpos,
+            self._target_joint_qpos[
+                previous_phase_index, self._ours_active_dof
+            ],
+            self._ours_phase_target[previous_phase_index, 0],
+            self._ours_phase_direction[previous_phase_index, 0],
+            self._ours_progress_phase_start >= 0,
+            target_cap_scale=1.0,
+        )
+        gate, phase_id, all_previous_passed, phase_changed = (
+            phase_prerequisite_transition(
+                phase_start, phase_predecessor, phase_active,
+                self._ours_progress_phase_start, previous_phase_completion,
+                self._ours_progress_gate_open,
+                self._ours_progress_all_previous_passed,
+                mode=self._ours_progress_prerequisite_mode,
+                threshold=self._ours_progress_prerequisite_threshold,
+            )
         )
         phase_entry_qpos = torch.where(
             phase_changed,
@@ -1116,31 +1159,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             phase_direction,
             phase_active,
             target_cap_scale=self._ours_progress_target_cap_scale,
-        )
-        # 新阶段入口只看上一阶段在切换时的实际完成度，不记录历史最大值。
-        # cap 只扩展当前阶段的 reward；前序门始终按 canonical [0,1] 完成率判断，
-        # 避免超过 GT 终点的 overshoot 被用来补足未完成的 reference 行程。
-        previous_phase_index = self._ours_progress_phase_start.clamp_min(0)
-        previous_phase_completion = phase_relative_progress(
-            self._ours_previous_active_qpos,
-            self._ours_progress_phase_entry_qpos,
-            self._target_joint_qpos[
-                previous_phase_index, self._ours_active_dof
-            ],
-            self._ours_phase_target[previous_phase_index, 0],
-            self._ours_phase_direction[previous_phase_index, 0],
-            self._ours_progress_phase_start >= 0,
-            target_cap_scale=1.0,
-        )
-        gate, phase_id, all_previous_passed, _ = (
-            phase_prerequisite_transition(
-                phase_start, phase_predecessor, phase_active,
-                self._ours_progress_phase_start, previous_phase_completion,
-                self._ours_progress_gate_open,
-                self._ours_progress_all_previous_passed,
-                mode=self._ours_progress_prerequisite_mode,
-                threshold=self._ours_progress_prerequisite_threshold,
-            )
         )
         self._ours_progress_phase_start = phase_id
         self._ours_progress_phase_entry_qpos = torch.where(
@@ -1161,6 +1179,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 phase_target,
                 phase_direction,
                 phase_active,
+                lead_tolerance=self._ours_progress_lead_tolerance,
             )
         residual = self._ours_last_residual if self._ours_last_residual is not None else torch.zeros_like(self._ours_previous_residual)
         acceleration_valid = frames - episode_start > 2
