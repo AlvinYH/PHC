@@ -16,10 +16,15 @@ from phc.env.tasks.humanoid_im_passive_object import HumanoidImPassiveObject
 from phc.learning.network_loader import load_pnn
 from phc.utils.flags import flags
 from phc.utils.isaacgym_torch_utils import quat_apply
-from pipeline.physics.contact import joint_region_surface_distances_chunked
+from pipeline.physics.contact import (
+    finger_part_aware_distances,
+    joint_region_and_part_surface_distances_chunked,
+    joint_region_surface_distances_chunked,
+)
 from pipeline.physics.finger_segments import (
     FINGER_SEGMENT_BODY_NAMES,
     canonical_finger_segment_order,
+    load_finger_contact_part_link_names,
 )
 from pipeline.physics.ours.observation import OBSERVATION_DIM, build_observation
 from pipeline.physics.ours.policy import (
@@ -323,6 +328,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ):
             if not isinstance(self._ours_reward_weights[name], bool):
                 raise ValueError(f"ours {name} must be boolean")
+        if not isinstance(
+            self._ours_reward_weights.get("part_aware_contact_reward_enabled", False),
+            bool,
+        ):
+            raise ValueError("ours part_aware_contact_reward_enabled must be boolean")
         for name in ("coarse_contact_distance_weight", "fine_contact_distance_weight"):
             if float(self._ours_reward_weights[name]) < 0.0:
                 raise ValueError(f"ours {name} must be non-negative")
@@ -350,6 +360,17 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "contact_labels",
         }
         with np.load(self._ours_reference_path, allow_pickle=False) as data:
+            if bool(self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)):
+                needed.add("finger_contact_nearest_object_link_names")
+                has_part_names = "finger_contact_part_link_names" in data.files
+                has_part_schema = "finger_contact_part_schema" in data.files
+                if has_part_names != has_part_schema:
+                    raise ValueError("Studio part-aware finger GT fields must appear together")
+                if has_part_names:
+                    needed.update((
+                        "finger_contact_part_link_names",
+                        "finger_contact_part_schema",
+                    ))
             missing = sorted(needed.difference(data.files))
             if missing:
                 raise ValueError("Studio articulated reference lacks: " + ", ".join(missing))
@@ -654,6 +675,19 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dtype=torch.bool,
             device=self.device,
         )
+        if bool(self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)):
+            part_names = load_finger_contact_part_link_names(ref)[
+                :, reference_finger_order
+            ]
+            part_ids = np.full(part_names.shape, -1, dtype=np.int64)
+            for name in np.unique(part_names):
+                if name:
+                    part_ids[part_names == name] = object_names.index(str(name))
+            self._ours_finger_contact_part_ids = torch.tensor(
+                part_ids, dtype=torch.long, device=self.device,
+            )
+        else:
+            self._ours_finger_contact_part_ids = None
 
         reference_names = [str(name) for name in self._ours_reference_np["body_names"].reshape(-1)]
         if set(reference_names) != set(object_names) or len(reference_names) != len(object_names):
@@ -1098,16 +1132,38 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         current_surface = self._ours_world_surface_points(current_links)
         full_object_surface = self._ours_world_finger_contact_surface(current_links)
         finger_state = self._rigid_body_state_reshaped[:, self._ours_finger_ids]
-        finger_object_distance = joint_region_surface_distances_chunked(
-            finger_state[..., :3], full_object_surface,
-        )
-        # Coarse hand reward 也只由同侧手指距离聚合，避免用手腕碰撞体蹭取奖励。
-        hand_object_distance = whole_hand_object_distance(finger_object_distance)
-        finger_force = self._contact_forces.index_select(1, self._ours_finger_ids)
         reference_finger_contact = self._ours_finger_contact_reference[frames]
         reference_hand_contact = self._phc_contact_labels_hand2[frames].bool()
+        part_aware = bool(
+            self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)
+        )
+        if part_aware:
+            whole_finger_object_distance, part_distance = (
+                joint_region_and_part_surface_distances_chunked(
+                    finger_state[..., :3],
+                    full_object_surface,
+                    self._ours_finger_surface_link_ids,
+                    self._ours_finger_contact_part_ids[frames],
+                )
+            )
+        else:
+            # 关闭 part-aware 时只执行历史 whole-object 距离路径。
+            whole_finger_object_distance = joint_region_surface_distances_chunked(
+                finger_state[..., :3], full_object_surface,
+            )
+            part_distance = whole_finger_object_distance
+        # Coarse hand reward 始终沿用 whole-object 距离，不改变粗粒度语义。
+        hand_object_distance = whole_hand_object_distance(whole_finger_object_distance)
+        finger_force = self._contact_forces.index_select(1, self._ours_finger_ids)
+        finger_object_distance, finger_binary_contact_distance = finger_part_aware_distances(
+            whole_finger_object_distance,
+            part_distance,
+            reference_finger_contact,
+            part_aware=part_aware,
+        )
+        # Reset 继续使用旧的 whole-object live contact；part-aware 只改变 reward。
         live_finger_contact = finger_object_contact_indicator(
-            finger_object_distance,
+            whole_finger_object_distance,
             finger_force,
             distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
             force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
@@ -1226,7 +1282,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "reference_hand_contact": reference_hand_contact,
                 "reference_finger_contact": reference_finger_contact,
                 "hand_object_distance": hand_object_distance,
+                "finger_whole_object_distance": whole_finger_object_distance,
                 "finger_object_distance": finger_object_distance,
+                "finger_binary_contact_distance": finger_binary_contact_distance,
                 "finger_contact_force": finger_force,
                 "contact_force": self._contact_forces,
             },
