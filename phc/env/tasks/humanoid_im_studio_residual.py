@@ -281,6 +281,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError(
                 "ours progress reward weight must be non-negative and finite"
             )
+        eg3 = float(self._ours_reward_weights["eg3"])
+        if not np.isfinite(eg3) or eg3 < 0.0:
+            raise ValueError("ours eg3 must be finite and non-negative")
         if not 0.0 < float(self._ours_reward_weights["finger_contact_distance"]):
             raise ValueError("ours live finger-contact distance must be positive")
         if float(self._ours_reward_weights["finger_contact_force"]) < 0.0:
@@ -1225,6 +1228,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "hand_object_distance": hand_object_distance,
                 "finger_object_distance": finger_object_distance,
                 "finger_contact_force": finger_force,
+                "contact_force": self._contact_forces,
             },
             articulation={
                 "active_qpos": active,
