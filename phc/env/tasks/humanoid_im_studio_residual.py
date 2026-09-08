@@ -88,6 +88,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_progress_lead_tolerance = float(
             self._ours_reward_weights.pop("progress_lead_tolerance", 0.0)
         )
+        self._ours_part_knn_k = self._ours_reward_weights.pop(
+            "part_aware_part_knn_k", 2,
+        )
         self._ours_reset = dict(env["oursReset"])
         self._ours_residual_scale = float(env["oursResidualScale"])
         self._ours_teacher_frame_offset = int(env.get("oursTeacherFrameOffset", 0))
@@ -333,6 +336,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             bool,
         ):
             raise ValueError("ours part_aware_contact_reward_enabled must be boolean")
+        if isinstance(self._ours_part_knn_k, bool) or not isinstance(
+            self._ours_part_knn_k, int
+        ) or self._ours_part_knn_k < 1:
+            raise ValueError("ours part-aware part KNN count must be a positive integer")
         for name in ("coarse_contact_distance_weight", "fine_contact_distance_weight"):
             if float(self._ours_reward_weights[name]) < 0.0:
                 raise ValueError(f"ours {name} must be non-negative")
@@ -735,6 +742,15 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dtype=torch.long,
             device=self.device,
         )
+        self._ours_finger_surface_part_ids = torch.unique(
+            self._ours_finger_surface_link_ids, sorted=True,
+        )
+        if bool(self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)):
+            for link_id in self._ours_finger_surface_part_ids:
+                if int((self._ours_finger_surface_link_ids == link_id).sum()) < self._ours_part_knn_k:
+                    raise ValueError(
+                        "Studio part-aware finger surface has fewer points than part KNN count"
+                    )
         self._ours_bbox = torch.tensor(
             np.concatenate((ref["policy_root_bbox"], ref["policy_active_child_bbox"]), axis=0),
             dtype=torch.float32,
@@ -1138,13 +1154,18 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)
         )
         if part_aware:
-            whole_finger_object_distance, part_distance = (
+            whole_finger_object_distance, part_distance, selected_part_ids = (
                 joint_region_and_part_surface_distances_chunked(
                     finger_state[..., :3],
                     full_object_surface,
                     self._ours_finger_surface_link_ids,
+                    self._ours_finger_surface_part_ids,
                     self._ours_finger_contact_part_ids[frames],
+                    part_knn_k=self._ours_part_knn_k,
                 )
+            )
+            target_part_selected = (
+                selected_part_ids == self._ours_finger_contact_part_ids[frames]
             )
         else:
             # 关闭 part-aware 时只执行历史 whole-object 距离路径。
@@ -1152,6 +1173,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 finger_state[..., :3], full_object_surface,
             )
             part_distance = whole_finger_object_distance
+            target_part_selected = None
         # Coarse hand reward 始终沿用 whole-object 距离，不改变粗粒度语义。
         hand_object_distance = whole_hand_object_distance(whole_finger_object_distance)
         finger_force = self._contact_forces.index_select(1, self._ours_finger_ids)
@@ -1159,6 +1181,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             whole_finger_object_distance,
             part_distance,
             reference_finger_contact,
+            target_part_selected=target_part_selected,
             part_aware=part_aware,
         )
         # Reset 继续使用旧的 whole-object live contact；part-aware 只改变 reward。
