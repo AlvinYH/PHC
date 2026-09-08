@@ -1168,7 +1168,17 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
             force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
         )
-        self._ours_finger_object_distance = finger_object_distance
+        # 旧 telemetry 保持 whole-object 语义，统一评测口径不随 reward 开关变化。
+        self._ours_finger_object_distance = whole_finger_object_distance
+        self._ours_reward_finger_object_distance = finger_object_distance
+        self._ours_reward_finger_contact = live_finger_contact
+        if part_aware:
+            self._ours_reward_finger_contact = finger_object_contact_indicator(
+                finger_binary_contact_distance,
+                finger_force,
+                distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
+                force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
+            )
         self._ours_hand_object_distance = hand_object_distance
         self._ours_live_finger_contact = live_finger_contact
         episode_start = self._ours_episode_start_frames
@@ -1806,6 +1816,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "finger_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             "finger_contact_force": force.detach().cpu().numpy(),
             "finger_object_distance": self._ours_finger_object_distance.detach().cpu().numpy(),
+            "finger_part_aware_distance": self._ours_reward_finger_object_distance.detach().cpu().numpy(),
+            "finger_part_aware_contact": self._ours_reward_finger_contact.to(
+                dtype=force.dtype
+            ).detach().cpu().numpy(),
             "hand_object_distance": self._ours_hand_object_distance.detach().cpu().numpy(),
             "finger_object_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             # 兼容旧分析器字段名；语义已升级为 full-object，而不是 handle-only。
