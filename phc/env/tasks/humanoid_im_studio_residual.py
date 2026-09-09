@@ -27,6 +27,12 @@ from pipeline.physics.finger_segments import (
     load_finger_contact_part_link_names,
 )
 from pipeline.physics.ours.observation import OBSERVATION_DIM, build_observation
+from pipeline.physics.ours.drive_reward import (
+    active_child_gravity_effort,
+    active_joint_drive_reward,
+    dynamic_joint_frame,
+    validate_active_joint_drive_metadata,
+)
 from pipeline.physics.ours.policy import (
     compose_residual_action,
     normalize_teacher_observation,
@@ -91,6 +97,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_part_knn_k = self._ours_reward_weights.pop(
             "part_aware_part_knn_k", 2,
         )
+        self._ours_active_joint_drive_enabled = self._ours_reward_weights.pop(
+            "active_joint_drive_enabled", False,
+        )
         self._ours_reset = dict(env["oursReset"])
         self._ours_residual_scale = float(env["oursResidualScale"])
         self._ours_teacher_frame_offset = int(env.get("oursTeacherFrameOffset", 0))
@@ -131,6 +140,16 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_closed_loop_rows = []
         self._ours_closed_loop_pending = None
         self._ours_last_reward_terms = None
+        self._ours_last_drive_terms = None
+        self._ours_drive_reference_frames = None
+        self._ours_active_nearest_point = None
+        self._ours_active_live_contact = None
+        self._ours_drive_finger_position = None
+        self._ours_drive_selected_part_ids = None
+        self._ours_drive_parent_state = None
+        self._ours_drive_child_state = None
+        self._ours_joint_origin_world = None
+        self._ours_joint_axis_world = None
         self._ours_reward_sum = {}
         self._ours_reward_min = {}
         self._ours_reward_max = {}
@@ -336,6 +355,51 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             bool,
         ):
             raise ValueError("ours part_aware_contact_reward_enabled must be boolean")
+        if not isinstance(self._ours_active_joint_drive_enabled, bool):
+            raise ValueError("ours active_joint_drive_enabled must be boolean")
+        if self._ours_active_joint_drive_enabled and not bool(
+            self._ours_reward_weights["part_aware_contact_reward_enabled"]
+        ):
+            raise ValueError(
+                "active-joint drive reward requires part-aware contact attribution"
+            )
+        if self._ours_active_joint_drive_enabled:
+            for name in (
+                "active_joint_drive_weight",
+                "active_joint_drive_opposition_weight",
+                "active_joint_drive_deadband_nm",
+            ):
+                value = float(self._ours_reward_weights[name])
+                if not np.isfinite(value) or value < 0.0:
+                    raise ValueError(f"ours {name} must be finite and non-negative")
+            scale = float(self._ours_reward_weights["active_joint_drive_scale_nm"])
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError(
+                    "ours active_joint_drive_scale_nm must be finite and positive"
+                )
+            if not isinstance(
+                self._ours_reward_weights["active_joint_drive_include_gravity"],
+                bool,
+            ):
+                raise ValueError(
+                    "ours active_joint_drive_include_gravity must be boolean"
+                )
+            if not isinstance(
+                self._ours_reward_weights[
+                    "active_joint_drive_require_reference_contact"
+                ],
+                bool,
+            ):
+                raise ValueError(
+                    "ours active_joint_drive_require_reference_contact must be boolean"
+                )
+            if not isinstance(
+                self._ours_reward_weights["active_joint_drive_use_progress_gate"],
+                bool,
+            ):
+                raise ValueError(
+                    "ours active_joint_drive_use_progress_gate must be boolean"
+                )
         if isinstance(self._ours_part_knn_k, bool) or not isinstance(
             self._ours_part_knn_k, int
         ) or self._ours_part_knn_k < 1:
@@ -643,6 +707,43 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dtype=torch.long,
             device=self.device,
         )
+        if self._ours_active_joint_drive_enabled:
+            self._ours_parent_object_index = object_names.index(self._ours_parent_link)
+            metadata = validate_active_joint_drive_metadata(
+                self._phc_object_config,
+                include_gravity=self._ours_reward_weights[
+                    "active_joint_drive_include_gravity"
+                ],
+            )
+            if (
+                metadata["parent_link"] != self._ours_parent_link
+                or metadata["child_link"] != self._ours_child_link
+            ):
+                raise ValueError(
+                    "active-joint drive metadata disagrees with the reference links"
+                )
+            self._ours_active_joint_type = metadata["joint_type"]
+            self._ours_joint_origin_parent = torch.tensor(
+                metadata["origin"],
+                dtype=torch.float32, device=self.device,
+            )
+            self._ours_joint_axis_parent = torch.tensor(
+                metadata["axis"],
+                dtype=torch.float32, device=self.device,
+            )
+            if self._ours_reward_weights["active_joint_drive_include_gravity"]:
+                self._ours_active_child_mass = torch.tensor(
+                    metadata["mass"],
+                    dtype=torch.float32, device=self.device,
+                )
+                self._ours_active_child_com_local = torch.tensor(
+                    metadata["com"],
+                    dtype=torch.float32, device=self.device,
+                )
+                self._ours_gravity_world = torch.tensor(
+                    metadata["gravity"],
+                    dtype=torch.float32, device=self.device,
+                )
 
         body_names = list(self._body_names)
         finger_order = ("Index", "Middle", "Pinky", "Ring", "Thumb")
@@ -1134,6 +1235,92 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ).reshape(object_link_state.shape[0], -1, 3)
         return world + link_state[..., :3]
 
+    def _ours_drive_reward(
+        self, current_links, finger_state, finger_force, selected_part_ids,
+        nearest_point, reference_finger_contact, frames, phase_direction,
+        phase_active, progress_gate,
+    ):
+        """复用 part-aware 接触，计算独立的逐指节驱动力矩项。"""
+
+        parent = current_links[:, self._ours_parent_object_index]
+        origin, axis = dynamic_joint_frame(
+            parent[:, :3], parent[:, 3:7],
+            self._ours_joint_origin_parent, self._ours_joint_axis_parent,
+        )
+        reference_active = reference_finger_contact & (
+            self._ours_finger_contact_part_ids[frames]
+            == self._ours_child_object_index
+        )
+        selected_distance = torch.linalg.norm(
+            finger_state[..., :3] - nearest_point, dim=-1,
+        )
+        live_active = finger_object_contact_indicator(
+            selected_distance, finger_force,
+            distance_threshold=float(
+                self._ours_reward_weights["finger_contact_distance"]
+            ),
+            force_threshold=float(
+                self._ours_reward_weights["finger_contact_force"]
+            ),
+        ) & (selected_part_ids == self._ours_child_object_index)
+        gravity = torch.zeros_like(phase_direction)
+        if self._ours_reward_weights["active_joint_drive_include_gravity"]:
+            child = current_links[:, self._ours_child_object_index]
+            gravity = active_child_gravity_effort(
+                child[:, :3], child[:, 3:7], self._ours_active_child_com_local,
+                self._ours_active_child_mass, self._ours_gravity_world, origin, axis,
+                joint_type=self._ours_active_joint_type,
+            )
+        gate = (
+            progress_gate
+            if self._ours_reward_weights["active_joint_drive_use_progress_gate"]
+            else phase_active
+        )
+        if self._ours_reward_weights["active_joint_drive_require_reference_contact"]:
+            gate = gate & reference_active.any(dim=-1)
+        reward, terms = active_joint_drive_reward(
+            nearest_point, finger_force, live_active, origin, axis, phase_direction,
+            gate, joint_type=self._ours_active_joint_type,
+            weight=float(self._ours_reward_weights["active_joint_drive_weight"]),
+            opposition_weight=float(
+                self._ours_reward_weights["active_joint_drive_opposition_weight"]
+            ),
+            deadband_nm=float(
+                self._ours_reward_weights["active_joint_drive_deadband_nm"]
+            ),
+            scale_nm=float(self._ours_reward_weights["active_joint_drive_scale_nm"]),
+            gravity_effort=gravity,
+            include_gravity=self._ours_reward_weights[
+                "active_joint_drive_include_gravity"
+            ],
+        )
+        terms.update({
+            "active_joint_phase_active": phase_active.to(dtype=reward.dtype),
+            "active_joint_progress_gate": progress_gate.to(dtype=reward.dtype),
+            "active_joint_reference_contact_gate": reference_active.any(
+                dim=-1,
+            ).to(dtype=reward.dtype),
+        })
+        if flags.im_eval:
+            # 只在单环境评测中冻结审计快照；训练不保留额外几何 tensor。
+            self._ours_active_nearest_point = nearest_point.detach().clone()
+            self._ours_active_live_contact = live_active.detach().clone()
+            self._ours_drive_finger_position = (
+                finger_state[..., :3].detach().clone()
+            )
+            self._ours_drive_selected_part_ids = selected_part_ids.detach().clone()
+            self._ours_drive_parent_state = parent.detach().clone()
+            self._ours_drive_child_state = (
+                current_links[:, self._ours_child_object_index].detach().clone()
+            )
+            self._ours_joint_origin_world = origin.detach().clone()
+            self._ours_joint_axis_world = axis.detach().clone()
+            self._ours_last_drive_terms = {
+                name: value.detach().clone() for name, value in terms.items()
+            }
+            self._ours_drive_reference_frames = frames.detach().clone()
+        return reward, terms
+
     def _compute_reward(self, actions):
         reference, reference_frames = self._ours_reference_motion()
         frames = self._ours_frames()
@@ -1153,9 +1340,26 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         part_aware = bool(
             self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)
         )
+        active_part_nearest_point = None
         if part_aware:
-            whole_finger_object_distance, part_distance, selected_part_ids = (
-                joint_region_and_part_surface_distances_chunked(
+            if self._ours_active_joint_drive_enabled:
+                (
+                    whole_finger_object_distance, part_distance, selected_part_ids,
+                    active_part_nearest_point,
+                ) = joint_region_and_part_surface_distances_chunked(
+                    finger_state[..., :3],
+                    full_object_surface,
+                    self._ours_finger_surface_link_ids,
+                    self._ours_finger_surface_part_ids,
+                    self._ours_finger_contact_part_ids[frames],
+                    part_knn_k=self._ours_part_knn_k,
+                    return_selected_nearest_point=True,
+                )
+            else:
+                # 力矩关闭时逐字保留已有 KNN 调用，不计算或返回作用点。
+                (
+                    whole_finger_object_distance, part_distance, selected_part_ids,
+                ) = joint_region_and_part_surface_distances_chunked(
                     finger_state[..., :3],
                     full_object_surface,
                     self._ours_finger_surface_link_ids,
@@ -1163,7 +1367,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                     self._ours_finger_contact_part_ids[frames],
                     part_knn_k=self._ours_part_knn_k,
                 )
-            )
             target_part_selected = (
                 selected_part_ids == self._ours_finger_contact_part_ids[frames]
             )
@@ -1259,6 +1462,18 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_progress_gate_open = gate
         self._ours_progress_all_previous_passed = all_previous_passed
         progress_gate = gate & phase_active
+        drive_reward = None
+        drive_terms = None
+        if self._ours_active_joint_drive_enabled:
+            if active_part_nearest_point is None:
+                raise RuntimeError(
+                    "active-joint drive requires part-aware nearest points"
+                )
+            drive_reward, drive_terms = self._ours_drive_reward(
+                current_links, finger_state, finger_force, selected_part_ids,
+                active_part_nearest_point, reference_finger_contact, frames,
+                phase_direction, phase_active, progress_gate,
+            )
         progress_bonus = phase_completion
         progress_overshoot = torch.zeros_like(phase_completion)
         if self._ours_progress_mode == "reference_paced_completion":
@@ -1344,6 +1559,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             indices=self._ours_reward_indices,
             weights=self._ours_reward_weights,
         )
+        if drive_reward is not None:
+            # 力矩项独立相加；关闭时 compute_reward 的旧路径完全不变。
+            reward = reward + drive_reward
+            terms.update(drive_terms)
         self.rew_buf[:] = reward
         self._ours_required_hand_contact = reference_hand_contact
         self._ours_live_hand_region_contact = live_finger_contact.reshape(
@@ -1563,6 +1782,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         return result
 
     def _reset_env_tensors(self, env_ids):
+        if self._ours_active_joint_drive_enabled and len(env_ids):
+            # 在实际写回仿真状态的底层 reset 点失效缓存，避免内部 reset 绕过公开 reset()。
+            self._ours_last_drive_terms = None
+            self._ours_drive_reference_frames = None
         humanoid_ids = self._humanoid_actor_ids[env_ids]
         target_ids = self._tar_actor_ids[env_ids]
         combined_ids = torch.cat((humanoid_ids, target_ids)).to(torch.int32)
@@ -1850,6 +2073,81 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "finger_handle_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             "hinge_phase_active": self._ours_phase_active[frames].detach().cpu().numpy(),
         }
+        if self._ours_active_joint_drive_enabled:
+            if (
+                self._ours_last_drive_terms is None
+                or self._ours_drive_reference_frames is None
+            ):
+                raise RuntimeError("active-joint drive telemetry has not been computed")
+            if not torch.equal(self._ours_drive_reference_frames, frames):
+                raise RuntimeError(
+                    "active-joint drive telemetry is stale for the current frame"
+                )
+            rollout["ours_evaluation"].update({
+                "finger_contact_force_xyz": force_components.detach().cpu().numpy(),
+                "finger_body_position_world": (
+                    self._ours_drive_finger_position.detach().cpu().numpy()
+                ),
+                "finger_selected_part_id": (
+                    self._ours_drive_selected_part_ids.detach().cpu().numpy()
+                ),
+                "finger_active_contact": (
+                    self._ours_active_live_contact.to(dtype=force.dtype)
+                    .detach().cpu().numpy()
+                ),
+                "finger_active_nearest_point_world": (
+                    self._ours_active_nearest_point.detach().cpu().numpy()
+                ),
+                "active_joint_origin_world": (
+                    self._ours_joint_origin_world.detach().cpu().numpy()
+                ),
+                "active_joint_axis_world": (
+                    self._ours_joint_axis_world.detach().cpu().numpy()
+                ),
+                "active_joint_parent_state_world": (
+                    self._ours_drive_parent_state
+                    .detach().cpu().numpy()
+                ),
+                "active_joint_child_state_world": (
+                    self._ours_drive_child_state
+                    .detach().cpu().numpy()
+                ),
+                "active_joint_qpos": (
+                    self._target_dof_pos[:, self._ours_active_dof]
+                    .detach().cpu().numpy()
+                ),
+                "active_joint_qvel": (
+                    self._target_dof_vel[:, self._ours_active_dof]
+                    .detach().cpu().numpy()
+                ),
+                "active_joint_reference_qpos": (
+                    self._target_qpos_ref_for_frames(frames)[:, self._ours_active_dof]
+                    .detach().cpu().numpy()
+                ),
+                # Isaac 会按拓扑重排 object bodies；显式发布 active child 的 runtime id。
+                "active_joint_child_object_index": torch.full_like(
+                    frames, self._ours_child_object_index,
+                ).detach().cpu().numpy(),
+                "active_joint_parent_object_index": torch.full_like(
+                    frames, self._ours_parent_object_index,
+                ).detach().cpu().numpy(),
+                "active_joint_phase_direction": (
+                    self._ours_phase_direction[frames, 0].detach().cpu().numpy()
+                ),
+                "finger_reference_active_contact": (
+                    (
+                        self._ours_finger_contact_reference[frames]
+                        & (
+                            self._ours_finger_contact_part_ids[frames]
+                            == self._ours_child_object_index
+                        )
+                    ).to(dtype=force.dtype).detach().cpu().numpy()
+                ),
+                **{
+                    name: value.detach().cpu().numpy()
+                    for name, value in self._ours_last_drive_terms.items()
+                },
+            })
 
     def finalize_ours_outputs(self):
         """Flush bounded diagnostics once at the agent/player lifecycle boundary."""
