@@ -36,9 +36,6 @@ from phc.env.tasks.humanoid_im_getup import HumanoidImGetup
 from phc.env.tasks.humanoid_im_mcp import HumanoidImMCP
 from phc.env.tasks.humanoid_im_mcp_getup import HumanoidImMCPGetup
 from phc.env.tasks.vec_task_wrappers import VecTaskPythonWrapper
-from phc.env.tasks.humanoid_im_demo import HumanoidImDemo
-from phc.env.tasks.humanoid_im_mcp_demo import HumanoidImMCPDemo
-
 from isaacgym import rlgpu
 
 import json
@@ -50,6 +47,11 @@ def warn_task_name():
 
 
 def parse_task(args, cfg, cfg_train, sim_params):
+    # Demo task 才需要 websocket/图形依赖，普通 headless task 不提前导入。
+    if args.task == "HumanoidImDemo":
+        from phc.env.tasks.humanoid_im_demo import HumanoidImDemo
+    elif args.task == "HumanoidImMCPDemo":
+        from phc.env.tasks.humanoid_im_mcp_demo import HumanoidImMCPDemo
 
     # create native task and pass custom config
     device_id = args.device_id

@@ -50,7 +50,7 @@ import imageio
 from datetime import datetime
 from phc.utils.flags import flags
 from collections import defaultdict
-import aiohttp, cv2, asyncio
+import cv2, asyncio
 import json
 from collections import deque
 import threading
@@ -178,12 +178,19 @@ class BaseTask():
         self.recorder_camera_handles = []
         self.max_num_camera = 10
         self.viewing_env_idx = 0
-        for idx, env in enumerate(self.envs):
-            self.recorder_camera_handles.append(self.gym.create_camera_sensor(env, gymapi.CameraProperties()))
-            if idx > self.max_num_camera:
-                break
-
-        self.recorder_camera_handle = self.recorder_camera_handles[0]
+        # compute-only/headless 路径不创建任何 camera sensor。
+        if not self.headless:
+            for idx, env in enumerate(self.envs):
+                self.recorder_camera_handles.append(
+                    self.gym.create_camera_sensor(env, gymapi.CameraProperties())
+                )
+                if idx > self.max_num_camera:
+                    break
+        self.recorder_camera_handle = (
+            self.recorder_camera_handles[0]
+            if self.recorder_camera_handles
+            else None
+        )
         self.recording, self.recording_state_change = False, False
         self.max_video_queue_size = 100000
         self._video_queue = deque(maxlen=self.max_video_queue_size)
@@ -261,6 +268,8 @@ class BaseTask():
 
     #print(URL)
     async def talk(self):
+        import aiohttp
+
         URL = 'http://klab-cereal.pc.cs.cmu.edu:8080/ws'
         print("Starting websocket client")
         session = aiohttp.ClientSession()
@@ -304,6 +313,8 @@ class BaseTask():
 
     #print(URL)
     async def video_stream(self):
+        import aiohttp
+
         URL = 'http://klab-cereal.pc.cs.cmu.edu:8080/ws'
         print("Starting websocket client")
         session = aiohttp.ClientSession()

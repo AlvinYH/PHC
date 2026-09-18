@@ -32,6 +32,7 @@ import sys
 import pdb
 import os.path as osp
 from pathlib import Path
+from fractions import Fraction
 os.environ["OMP_NUM_THREADS"] = "1"
 
 sys.path.append(os.getcwd())
@@ -78,8 +79,8 @@ cfg_train = None
 def parse_sim_params(cfg):
     # initialize sim
     sim_params = gymapi.SimParams()
-    step_dt = cfg.sim.physx.step_dt
-    sim_params.dt = float(step_dt) if isinstance(step_dt, (int, float)) else eval(step_dt)
+    # 同时接受作者配置的 "1/60" 和合并配置解析后的等值浮点数。
+    sim_params.dt = float(Fraction(str(cfg.sim.physx.step_dt)))
     sim_params.num_client_threads = cfg.sim.slices
     
     if cfg.sim.use_flex:
