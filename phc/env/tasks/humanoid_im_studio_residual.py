@@ -15,7 +15,7 @@ from phc.env.tasks.humanoid_im import compute_imitation_observations_v6
 from phc.env.tasks.humanoid_im_passive_object import HumanoidImPassiveObject
 from phc.learning.network_loader import load_pnn
 from phc.utils.flags import flags
-from phc.utils.isaacgym_torch_utils import quat_apply
+from phc.utils.isaacgym_torch_utils import quat_apply, slerp
 from pipeline.physics.contact import (
     finger_part_aware_distances,
     joint_region_and_part_surface_distances_chunked,
@@ -74,6 +74,14 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_hybrid_init_max_fraction = float(env["hybridInitMaxFraction"])
         if not 0.0 <= self._ours_hybrid_init_max_fraction <= 1.0:
             raise ValueError("ours Hybrid max fraction must be in [0,1]")
+        self._ours_hybrid_random_init_mode = str(env["hybridRandomInitMode"])
+        if self._ours_hybrid_random_init_mode not in {
+            "default", "random", "pre_contact",
+        }:
+            raise ValueError(
+                "ours Hybrid random init mode must be default, random, "
+                "or pre_contact"
+            )
         self._ours_hybrid_start_mask = None
         self._ours_reference_path = Path(env["oursReferencePath"]).expanduser()
         self._ours_reward_weights = dict(env["oursReward"])
@@ -158,7 +166,24 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_batch_step_pre = None
         self._ours_batch_substeps = None
         self._ours_prepare_files()
+        reference_contact = np.asarray(self._ours_reference_np["contact_labels"])
+        contact_frames = np.flatnonzero(np.any(reference_contact, axis=1))
+        self._ours_first_contact_frame = (
+            None if len(contact_frames) == 0 else int(contact_frames[0])
+        )
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
+        self._ours_opening_q_sum = torch.zeros(
+            (), dtype=torch.float64, device=self.device,
+        )
+        self._ours_opening_reference_q_sum = torch.zeros(
+            (), dtype=torch.float64, device=self.device,
+        )
+        self._ours_opening_q_error_sum = torch.zeros(
+            (), dtype=torch.float64, device=self.device,
+        )
+        self._ours_opening_q_count = torch.zeros(
+            (), dtype=torch.int64, device=self.device,
+        )
         self._ours_bind_studio_tensors()
         self._compute_observations()
         self._ours_capture_trace()
@@ -186,8 +211,47 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dof_vel, **kwargs,
         )
 
+    def _object_reference_state_at_times(self, motion_times):
+        """Look up the object reference at the same continuous time as the human."""
+
+        frame = (
+            motion_times * float(self._target_qpos_fps)
+        ).clamp(0.0, float(self._ours_ref_root_state.shape[0] - 1))
+        lower = torch.floor(frame).long()
+        upper = (lower + 1).clamp(max=self._ours_ref_root_state.shape[0] - 1)
+        blend = (frame - lower.to(frame)).unsqueeze(-1)
+
+        root_lower = self._ours_ref_root_state[lower]
+        root_upper = self._ours_ref_root_state[upper]
+        root_state = torch.cat((
+            torch.lerp(root_lower[:, :3], root_upper[:, :3], blend),
+            slerp(root_lower[:, 3:7], root_upper[:, 3:7], blend),
+            torch.lerp(root_lower[:, 7:], root_upper[:, 7:], blend),
+        ), dim=-1)
+        qpos = torch.lerp(
+            self._target_joint_qpos[lower], self._target_joint_qpos[upper], blend,
+        )
+        qvel = torch.lerp(
+            self._target_joint_qvel[lower], self._target_joint_qvel[upper], blend,
+        )
+        return root_state, qpos, qvel
+
     def _reset_actors(self, env_ids):
         super()._reset_actors(env_ids)
+        motion_times = (
+            self._motion_start_times[env_ids]
+            + self._motion_start_times_offset[env_ids]
+        )
+        root_state, qpos, qvel = self._object_reference_state_at_times(
+            motion_times,
+        )
+        self._target_states[env_ids] = root_state
+        self._target_dof_pos[env_ids] = qpos
+        self._target_dof_vel[env_ids] = qvel
+        self._target_last_reset_joint_qpos[env_ids] = qpos
+        self._target_last_reset_reference_frame[env_ids] = torch.floor(
+            motion_times * float(self._target_qpos_fps),
+        ).long().clamp(0, self._ours_ref_root_state.shape[0] - 1)
         if self._ours_reset_replay_np is None or len(env_ids) == 0:
             return
         if not self._ours_batch_replay and (
@@ -235,10 +299,33 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         """Bound Studio Hybrid reference starts without changing its materializer."""
 
         sampled = super()._sample_time(motion_ids)
+        if self._ours_hybrid_random_init_mode == "random":
+            return sampled
         if self._ours_hybrid_start_mask is None:
             return sampled
         if self._ours_hybrid_start_mask.shape != sampled.shape:
             raise RuntimeError("Studio Hybrid mask and motion batch differ")
+        if self._ours_hybrid_random_init_mode == "pre_contact":
+            if (
+                self._ours_first_contact_frame is None
+                or self._ours_first_contact_frame == 0
+            ):
+                raise ValueError(
+                    "pre_contact Hybrid init requires a contact label after frame zero"
+                )
+            frames = torch.randint(
+                self._ours_first_contact_frame,
+                motion_ids.shape,
+                device=self.device,
+            )
+            sampled_pre_contact = frames.to(dtype=torch.float32) / float(
+                self._target_qpos_fps
+            )
+            return torch.where(
+                self._ours_hybrid_start_mask,
+                torch.zeros_like(sampled_pre_contact),
+                sampled_pre_contact,
+            )
         motion_length = self._motion_lib.get_motion_length(motion_ids).to(sampled)
         rollout_bound = torch.clamp(motion_length - float(self.max_episode_length) * float(self.dt), min=0.0)
         fraction_bound = motion_length * self._ours_hybrid_init_max_fraction
@@ -248,12 +335,17 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         return torch.where(self._ours_hybrid_start_mask, torch.zeros_like(bounded), bounded)
 
     def _reset_hybrid_state_init(self, env_ids):
-        """Use Studio reference-state reset for both Hybrid branches."""
+        """Apply the selected Hybrid initialization distribution."""
 
         probability = float(self._hybrid_init_prob)
         if not 0.0 <= probability <= 1.0:
             raise ValueError("Studio Hybrid probability must be in [0,1]")
-        self._ours_hybrid_start_mask = torch.rand(len(env_ids), device=self.device) < probability
+        if self._ours_hybrid_random_init_mode == "random":
+            self._reset_ref_state_init(env_ids)
+            return
+        self._ours_hybrid_start_mask = (
+            torch.rand(len(env_ids), device=self.device) < probability
+        )
         try:
             self._reset_ref_state_init(env_ids)
         finally:
@@ -565,9 +657,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         """Use the single Ours reference instead of a PHC-X sidecar."""
 
         qpos = np.asarray(self._ours_reference_np["object_joint_qpos"], dtype=np.float32)
+        qvel = np.asarray(self._ours_reference_np["object_joint_qvel"], dtype=np.float32)
         names = list(self._ours_reference_joint_names)
         if qpos.ndim != 2 or not len(qpos) or not np.isfinite(qpos).all():
             raise ValueError("Studio object qpos must be finite [T,J]")
+        if qvel.shape != qpos.shape or not np.isfinite(qvel).all():
+            raise ValueError("Studio object qvel must be finite [T,J]")
         if names != list(self._target_joint_names) or qpos.shape[1] != len(names):
             raise ValueError("Studio object qpos joint names disagree with PHC config")
         dof_indices = []
@@ -577,11 +672,16 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dof_indices.append(self._target_asset_dof_names.index(name))
         full_qpos = np.zeros((qpos.shape[0], self._target_max_dof), dtype=np.float32)
         full_qpos[:, dof_indices] = qpos
+        full_qvel = np.zeros((qvel.shape[0], self._target_max_dof), dtype=np.float32)
+        full_qvel[:, dof_indices] = qvel
         self._target_active_dof_indices = torch.tensor(
             dof_indices, dtype=torch.long, device=self.device
         )
         self._target_joint_qpos = torch.tensor(
             full_qpos, dtype=torch.float32, device=self.device
+        )
+        self._target_joint_qvel = torch.tensor(
+            full_qvel, dtype=torch.float32, device=self.device
         )
 
     def _ours_bind_studio_tensors(self):
@@ -726,11 +826,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             ref["object_link_vel"][:, reference_order],
             ref["object_link_ang_vel"][:, reference_order],
         ), axis=-1), dtype=torch.float32, device=self.device)
-        self._ours_ref_qvel = torch.tensor(
-            ref["object_joint_qvel"][:, self._ours_active_reference_index:self._ours_active_reference_index + 1],
-            dtype=torch.float32,
-            device=self.device,
-        )
         self._ours_ref_root_state = torch.tensor(np.concatenate((
             ref["object_root_pos"], ref["object_root_rot_xyzw"],
             ref["object_root_vel"], ref["object_root_ang_vel"],
@@ -1219,7 +1314,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         active = self._target_dof_pos[:, self._ours_active_dof:self._ours_active_dof + 1]
         active_reference = self._target_qpos_ref_for_frames(frames)[:, self._ours_active_dof:self._ours_active_dof + 1]
         active_velocity = self._target_dof_vel[:, self._ours_active_dof:self._ours_active_dof + 1]
-        reference_velocity = self._ours_ref_qvel[frames]
+        reference_velocity = self._target_joint_qvel[
+            frames, self._ours_active_dof:self._ours_active_dof + 1,
+        ]
         actual_contact = body_contact_indicator(self._contact_forces)
         current_links = self._rigid_body_state_reshaped[:, self._ours_all_object_ids]
         current_surface = self._ours_world_surface_points(current_links)
@@ -1504,6 +1601,21 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_previous_active_qpos = active[:, 0].detach().clone()
         self._ours_action_rate_valid[:] = True
         self._ours_reward_count += 1
+        opening = phase_active & (phase_direction > 0.0)
+        opening_weight = opening.to(dtype=torch.float64)
+        self._ours_opening_q_sum += (
+            terms["active_hinge_q"].detach().to(dtype=torch.float64)
+            * opening_weight
+        ).sum()
+        self._ours_opening_reference_q_sum += (
+            terms["reference_hinge_q"].detach().to(dtype=torch.float64)
+            * opening_weight
+        ).sum()
+        self._ours_opening_q_error_sum += (
+            terms["active_hinge_q_error"].detach().to(dtype=torch.float64)
+            * opening_weight
+        ).sum()
+        self._ours_opening_q_count += opening.sum(dtype=torch.int64)
         values = {"total": reward, **terms}
         ranged_names = {
             "active_hinge_q",
@@ -1648,6 +1760,20 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             result["hinge_q_at_peak_progress"] = float(
                 self._ours_hinge_q_at_peak_progress.cpu()
             )
+        if self._ours_opening_q_count.item() > 0:
+            opening_count = self._ours_opening_q_count.to(dtype=torch.float64)
+            result["opening_hinge_q"] = float(
+                (self._ours_opening_q_sum / opening_count).cpu()
+            )
+            result["opening_reference_hinge_q"] = float(
+                (self._ours_opening_reference_q_sum / opening_count).cpu()
+            )
+            result["opening_hinge_q_error"] = float(
+                (self._ours_opening_q_error_sum / opening_count).cpu()
+            )
+            result["opening_hinge_q_sample_count"] = int(
+                self._ours_opening_q_count.cpu()
+            )
         if clear:
             self._ours_reward_sum.clear()
             self._ours_reward_min.clear()
@@ -1655,6 +1781,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_peak_progress = None
             self._ours_hinge_q_at_peak_progress = None
             self._ours_reward_count = 0
+            self._ours_opening_q_sum.zero_()
+            self._ours_opening_reference_q_sum.zero_()
+            self._ours_opening_q_error_sum.zero_()
+            self._ours_opening_q_count.zero_()
         return result
 
     def ours_reset_scalars(self, clear=True):

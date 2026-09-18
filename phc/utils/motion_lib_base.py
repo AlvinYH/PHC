@@ -459,8 +459,8 @@ class MotionLibBase():
         if (truncate_time is not None):
             assert (truncate_time >= 0.0)
             motion_len -= truncate_time
-        curr_fps = 1 / 30
-        motion_time = ((phase * motion_len) / curr_fps).long() * curr_fps
+        interval = float(self.m_cfg["step_dt"])
+        motion_time = torch.floor((phase * motion_len) / interval) * interval
 
         return motion_time
 

@@ -791,12 +791,6 @@ class HumanoidImPassiveObject(HumanoidIm):
         if len(env_ids) == 0 or self._target_dof_pos is None:
             return
 
-        target_bodies = self._rigid_body_state_reshaped[
-            :, self.num_bodies : self.num_bodies + self._target_asset_body_count
-        ]
-        target_bodies[env_ids, :, 0:3] = self._target_initial_body_pos
-        target_bodies[env_ids, :, 3:7] = self._target_initial_body_quat
-        target_bodies[env_ids, :, 7:13] = 0.0
         self._compute_observations(env_ids)
 
         if not flags.im_eval:
