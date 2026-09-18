@@ -227,37 +227,74 @@ class MotionLibBase():
 
 
         motion_data_list = self._motion_data_list[sample_idxes.cpu().numpy()]
+        reuse_single_motion = (
+            self._num_unique_motions == 1
+            and max_len == -1
+            and not self.m_cfg.randomrize_heading
+            and torch.equal(
+                sample_idxes,
+                sample_idxes[:1].expand_as(sample_idxes),
+            )
+            and all(tree is skeleton_trees[0] for tree in skeleton_trees)
+            and isinstance(gender_betas, torch.Tensor)
+            and isinstance(limb_weights, torch.Tensor)
+            and torch.equal(
+                gender_betas,
+                gender_betas[:1].expand_as(gender_betas),
+            )
+            and torch.equal(
+                limb_weights,
+                limb_weights[:1].expand_as(limb_weights),
+            )
+        )
         torch.set_num_threads(1)
         mp.set_sharing_strategy('file_descriptor')
 
-        num_jobs = min(mp.cpu_count(), 64)
-
-        if num_jobs <= 8 or not self.multi_thread:
-            num_jobs = 1
-        if flags.debug:
-            num_jobs = 1
-        
-        res_acc = {}  # using dictionary ensures order of the results.
-        jobs = motion_data_list
-        chunk = np.ceil(len(jobs) / num_jobs).astype(int)
-        ids = np.arange(len(jobs))
-
-        jobs = [(ids[i:i + chunk], jobs[i:i + chunk], skeleton_trees[i:i + chunk], gender_betas[i:i + chunk],  self.mesh_parsers, self.m_cfg) for i in range(0, len(jobs), chunk)]
-        job_args = [jobs[i] for i in range(len(jobs))]
-        if len(jobs) > 1:
-            manager = mp.Manager()
-            queue = manager.Queue()
-            for i in range(1, len(jobs)):
-                worker_args = (*job_args[i], queue, i)
-                worker = mp.Process(target=self.load_motion_with_skeleton, args=worker_args)
-                worker.start()
-            res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
-            for i in tqdm(range(len(jobs) - 1)):
-                res = queue.get()
-                res_acc.update(res)
+        if reuse_single_motion:
+            print(
+                "Reusing one parsed reference motion across "
+                f"{len(skeleton_trees)} identical environments."
+            )
+            parsed = self.load_motion_with_skeleton(
+                np.array([0]),
+                motion_data_list[:1],
+                skeleton_trees[:1],
+                gender_betas[:1],
+                self.mesh_parsers,
+                self.m_cfg,
+                None,
+                0,
+            )[0]
+            res_acc = {index: parsed for index in range(len(motion_data_list))}
         else:
-            # 单 motion 直接加载，避免为一个任务启动额外 manager 进程。
-            res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
+            num_jobs = min(mp.cpu_count(), 64)
+
+            if num_jobs <= 8 or not self.multi_thread:
+                num_jobs = 1
+            if flags.debug:
+                num_jobs = 1
+
+            res_acc = {}  # using dictionary ensures order of the results.
+            jobs = motion_data_list
+            chunk = np.ceil(len(jobs) / num_jobs).astype(int)
+            ids = np.arange(len(jobs))
+
+            jobs = [(ids[i:i + chunk], jobs[i:i + chunk], skeleton_trees[i:i + chunk], gender_betas[i:i + chunk],  self.mesh_parsers, self.m_cfg) for i in range(0, len(jobs), chunk)]
+            job_args = [jobs[i] for i in range(len(jobs))]
+            if len(jobs) > 1:
+                manager = mp.Manager()
+                queue = manager.Queue()
+                for i in range(1, len(jobs)):
+                    worker_args = (*job_args[i], queue, i)
+                    worker = mp.Process(target=self.load_motion_with_skeleton, args=worker_args)
+                    worker.start()
+                res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
+                for i in tqdm(range(len(jobs) - 1)):
+                    res = queue.get()
+                    res_acc.update(res)
+            else:
+                # 单 motion 直接加载，避免为一个任务启动额外 manager 进程。
+                res_acc.update(self.load_motion_with_skeleton(*jobs[0], None, 0))
 
         for f in tqdm(range(len(res_acc))):
             motion_file_data, curr_motion = res_acc[f]
