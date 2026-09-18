@@ -98,6 +98,13 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_active_joint_torque_enabled = self._ours_reward_weights[
             "active_joint_torque"
         ]["enabled"]
+        self._ours_part_aware_contact_reward_enabled = self._ours_reward_weights[
+            "part_aware_contact_reward_enabled"
+        ]
+        self._ours_needs_part_attribution = (
+            bool(self._ours_part_aware_contact_reward_enabled)
+            or self._ours_active_joint_torque_enabled
+        )
         self._ours_reset = dict(env["oursReset"])
         self._ours_residual_scale = float(env["oursResidualScale"])
         self._ours_teacher_frame_offset = int(env.get("oursTeacherFrameOffset", 0))
@@ -336,10 +343,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ):
             if not isinstance(self._ours_reward_weights[name], bool):
                 raise ValueError(f"ours {name} must be boolean")
-        if not isinstance(
-            self._ours_reward_weights.get("part_aware_contact_reward_enabled", False),
-            bool,
-        ):
+        if not isinstance(self._ours_part_aware_contact_reward_enabled, bool):
             raise ValueError("ours part_aware_contact_reward_enabled must be boolean")
         if not isinstance(self._ours_active_joint_torque_enabled, bool):
             raise ValueError("ours active_joint_torque.enabled must be boolean")
@@ -379,7 +383,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "active_joint_axis_parent_local",
             ))
         with np.load(self._ours_reference_path, allow_pickle=False) as data:
-            if bool(self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)):
+            if self._ours_needs_part_attribution:
                 needed.add("finger_contact_nearest_object_link_names")
                 has_part_names = "finger_contact_part_link_names" in data.files
                 has_part_schema = "finger_contact_part_schema" in data.files
@@ -698,7 +702,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dtype=torch.bool,
             device=self.device,
         )
-        if bool(self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)):
+        if self._ours_needs_part_attribution:
             part_names = load_finger_contact_part_link_names(ref)[
                 :, reference_finger_order
             ]
@@ -758,16 +762,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_surface_points_local = torch.tensor(surface_points, dtype=torch.float32, device=self.device)
         self._ours_surface_link_ids = torch.tensor([object_names.index(name) for name in surface_names], dtype=torch.long, device=self.device)
         if self._ours_active_joint_torque_enabled:
-            active_surface = self._ours_surface_link_ids.eq(
-                self._ours_child_object_index
-            )
-            if not bool(active_surface.any()):
-                raise ValueError(
-                    "Studio collision surface is missing the active child link"
-                )
-            self._ours_active_child_surface_points_local = (
-                self._ours_surface_points_local[active_surface]
-            )
             origin = np.asarray(
                 ref["active_joint_origin_parent_local_scaled"], dtype=np.float32,
             )
@@ -813,7 +807,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_finger_surface_part_ids = torch.unique(
             self._ours_finger_surface_link_ids, sorted=True,
         )
-        if bool(self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)):
+        if self._ours_needs_part_attribution:
             for link_id in self._ours_finger_surface_part_ids:
                 if int((self._ours_finger_surface_link_ids == link_id).sum()) < self._ours_part_knn_k:
                     raise ValueError(
@@ -1204,7 +1198,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
 
     def _ours_active_joint_frame(self):
         parent = self._rigid_body_state_reshaped[:, self._ours_parent_body_id]
-        rotation = parent[:, 3:7]
+        rotation = parent[:, 3:7] / parent[:, 3:7].norm(
+            dim=-1, keepdim=True,
+        ).clamp_min(1.0e-9)
         origin = parent[:, :3] + quat_apply(
             rotation,
             self._ours_active_joint_origin_parent_local.expand_as(parent[:, :3]),
@@ -1214,17 +1210,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_active_joint_axis_parent_local.expand_as(parent[:, :3]),
         )
         return origin, axis / axis.norm(dim=-1, keepdim=True).clamp_min(1.0e-9)
-
-    def _ours_active_child_surface_points(self):
-        child = self._rigid_body_state_reshaped[:, self._ours_child_body_id]
-        points = self._ours_active_child_surface_points_local.unsqueeze(0).expand(
-            self.num_envs, -1, -1,
-        )
-        world = quat_apply(
-            child[:, 3:7].unsqueeze(1).expand(-1, points.shape[1], -1).reshape(-1, 4),
-            points.reshape(-1, 3),
-        ).reshape_as(points)
-        return world + child[:, None, :3]
 
     def _compute_reward(self, actions):
         reference, reference_frames = self._ours_reference_motion()
@@ -1242,20 +1227,32 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         finger_state = self._rigid_body_state_reshaped[:, self._ours_finger_ids]
         reference_finger_contact = self._ours_finger_contact_reference[frames]
         reference_hand_contact = self._phc_contact_labels_hand2[frames].bool()
-        part_aware = bool(
-            self._ours_reward_weights.get("part_aware_contact_reward_enabled", False)
-        )
-        if part_aware:
-            (
-                whole_finger_object_distance, part_distance, selected_part_ids,
-            ) = joint_region_and_part_surface_distances_chunked(
-                finger_state[..., :3],
-                full_object_surface,
-                self._ours_finger_surface_link_ids,
-                self._ours_finger_surface_part_ids,
-                self._ours_finger_contact_part_ids[frames],
-                part_knn_k=self._ours_part_knn_k,
-            )
+        part_aware = self._ours_part_aware_contact_reward_enabled
+        if self._ours_needs_part_attribution:
+            if self._ours_active_joint_torque_enabled:
+                (
+                    whole_finger_object_distance, part_distance, selected_part_ids,
+                    active_part_nearest_point,
+                ) = joint_region_and_part_surface_distances_chunked(
+                    finger_state[..., :3],
+                    full_object_surface,
+                    self._ours_finger_surface_link_ids,
+                    self._ours_finger_surface_part_ids,
+                    self._ours_finger_contact_part_ids[frames],
+                    part_knn_k=self._ours_part_knn_k,
+                    return_selected_nearest_point=True,
+                )
+            else:
+                (
+                    whole_finger_object_distance, part_distance, selected_part_ids,
+                ) = joint_region_and_part_surface_distances_chunked(
+                    finger_state[..., :3],
+                    full_object_surface,
+                    self._ours_finger_surface_link_ids,
+                    self._ours_finger_surface_part_ids,
+                    self._ours_finger_contact_part_ids[frames],
+                    part_knn_k=self._ours_part_knn_k,
+                )
             target_part_selected = (
                 selected_part_ids == self._ours_finger_contact_part_ids[frames]
             )
@@ -1393,24 +1390,32 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "progress_gate_open": progress_gate,
         }
         if self._ours_active_joint_torque_enabled:
-            finger_points = finger_state[..., :3]
-            distance = torch.cdist(
-                finger_points, self._ours_active_child_surface_points(),
-            ).amin(dim=-1)
+            selected_distance = torch.linalg.norm(
+                finger_state[..., :3] - active_part_nearest_point, dim=-1,
+            )
             origin, axis = self._ours_active_joint_frame()
             contact.update({
-                "finger_contact_points": finger_points,
+                "finger_contact_points": active_part_nearest_point,
                 "finger_active_joint_contact": (
-                    distance < float(self._ours_reward_weights["finger_contact_distance"])
+                    selected_distance
+                    < float(self._ours_reward_weights["finger_contact_distance"])
                 ) & (
                     finger_force.abs().amax(dim=-1)
                     > float(self._ours_reward_weights["finger_contact_force"])
+                ) & (selected_part_ids == self._ours_child_object_index),
+                "reference_active_joint_contact": (
+                    reference_finger_contact
+                    & (
+                        self._ours_finger_contact_part_ids[frames]
+                        == self._ours_child_object_index
+                    )
                 ),
             })
             articulation.update({
                 "active_joint_origin_world": origin,
                 "active_joint_axis_world": axis,
                 "active_joint_phase_direction": phase_direction,
+                "active_joint_phase_active": phase_active,
             })
         reward, terms = compute_reward(
             human={
