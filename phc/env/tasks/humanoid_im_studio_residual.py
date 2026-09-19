@@ -114,10 +114,34 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             or self._ours_active_joint_torque_enabled
         )
         self._ours_reset = dict(env["oursReset"])
-        self._ours_residual_scale = float(env["oursResidualScale"])
+        # Older residual commands carry no mode flag, so absent means residual.
+        action_mode = str(env.get("oursActionMode", "residual"))
+        if action_mode not in ("residual", "direct"):
+            raise ValueError(
+                "ours action mode must be residual or direct, got "
+                + repr(action_mode)
+            )
+        self._ours_action_mode = action_mode
+        # "direct" is the no-tracker ablation: Humanoid.pth is neither loaded
+        # nor inferred and the policy emits the final action itself. Only
+        # "residual" needs any tracker configuration.
+        self._ours_is_direct = action_mode == "direct"
         self._ours_teacher_frame_offset = int(env.get("oursTeacherFrameOffset", 0))
-        self._ours_tracker_path = Path(env["studioTrackerCheckpoint"]).expanduser()
-        self._ours_tracker_activation = env["studioTrackerActivation"]
+        if self._ours_is_direct:
+            self._ours_residual_scale = None
+            self._ours_tracker_path = None
+            self._ours_tracker_activation = None
+            if self._ours_teacher_frame_offset:
+                raise ValueError(
+                    "diagnostic teacher frame offset requires the residual "
+                    "action mode because direct mode has no teacher action"
+                )
+        else:
+            self._ours_residual_scale = float(env["oursResidualScale"])
+            self._ours_tracker_path = Path(
+                env["studioTrackerCheckpoint"]
+            ).expanduser()
+            self._ours_tracker_activation = env["studioTrackerActivation"]
         self._ours_trace_path = Path(env["oursTracePath"]).expanduser() if env.get("oursTracePath") else None
         self._ours_eval_path = Path(env["oursEvalPath"]).expanduser()
         self._ours_closed_loop_trace_path = Path(env["oursClosedLoopTracePath"]).expanduser() if env.get("oursClosedLoopTracePath") else None
@@ -417,14 +441,19 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_hybrid_start_mask = None
 
     def _ours_prepare_files(self):
-        for path, description in (
-            (self._ours_reference_path, "articulated reference"),
-            (self._ours_tracker_path, "PHC-X tracker checkpoint"),
-        ):
-            if not path.is_file():
-                raise FileNotFoundError(f"Studio {description} is missing: {path}")
-        if self._ours_tracker_activation != "silu":
-            raise ValueError("Studio tracker activation must be SiLU")
+        if not self._ours_reference_path.is_file():
+            raise FileNotFoundError(
+                f"Studio articulated reference is missing: {self._ours_reference_path}"
+            )
+        # direct mode never loads the tracker, so its checkpoint is not checked.
+        if not self._ours_is_direct:
+            if not self._ours_tracker_path.is_file():
+                raise FileNotFoundError(
+                    f"Studio PHC-X tracker checkpoint is missing: "
+                    f"{self._ours_tracker_path}"
+                )
+            if self._ours_tracker_activation != "silu":
+                raise ValueError("Studio tracker activation must be SiLU")
         if self._ours_teacher_frame_offset not in (0, 1):
             raise ValueError("diagnostic teacher frame offset must be 0 or 1")
         if self._ours_reward_weights["ig"] != 0.0 or self._ours_reward_weights["handle_normal"] != 0.0:
@@ -1039,16 +1068,22 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         if not torch.isfinite(region_points).all():
             raise FloatingPointError("Studio live active contact-region geometry is non-finite")
 
-        checkpoint = torch_ext.load_checkpoint(str(self._ours_tracker_path))
-        self._ours_pnn = load_pnn(
-            checkpoint,
-            num_prim=int(self.cfg["env"]["num_prim"]),
-            has_lateral=bool(self.cfg["env"]["has_lateral"]),
-            activation=self._ours_tracker_activation,
-            device=self.device,
-        )
-        self._ours_mean = checkpoint["running_mean_std"]["running_mean"].float().to(self.device)
-        self._ours_var = checkpoint["running_mean_std"]["running_var"].float().to(self.device)
+        if self._ours_is_direct:
+            # No load_checkpoint, no load_pnn, no inference.
+            self._ours_pnn = None
+            self._ours_mean = None
+            self._ours_var = None
+        else:
+            checkpoint = torch_ext.load_checkpoint(str(self._ours_tracker_path))
+            self._ours_pnn = load_pnn(
+                checkpoint,
+                num_prim=int(self.cfg["env"]["num_prim"]),
+                has_lateral=bool(self.cfg["env"]["has_lateral"]),
+                activation=self._ours_tracker_activation,
+                device=self.device,
+            )
+            self._ours_mean = checkpoint["running_mean_std"]["running_mean"].float().to(self.device)
+            self._ours_var = checkpoint["running_mean_std"]["running_var"].float().to(self.device)
 
         if self._ours_num_traj > 1:
             # Progress phase boundaries follow trajectory zero's joint profile;
@@ -1132,15 +1167,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         return self._target_frame_indices(env_ids).clamp(0, self._ours_ref_max_frame() - 1)
 
-    def _ours_teacher(self, reference, body_observation):
-        teacher_times = (
-            (self.progress_buf.float() + self._ours_teacher_frame_offset) * self.dt
-            + self._motion_start_times
-            + self._motion_start_times_offset
-        )
-        self._ours_teacher_input_frames = torch.round(
-            teacher_times * float(self._target_qpos_fps)
-        ).long().clamp(0, self._ours_ref_max_frame() - 1)
+    def _ours_teacher(self, reference, body_observation, teacher_times):
+        # teacher_times and _ours_teacher_input_frames come from the caller so
+        # that both modes share exactly one frame computation.
         if self._ours_teacher_frame_offset:
             reference = self._get_state_from_motionlib_cache(
                 self._sampled_motion_ids, teacher_times, self._global_offset,
@@ -1176,15 +1205,33 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
 
     def _compute_observations(self, env_ids=None):
-        if not hasattr(self, "_ours_pnn"):
+        if not self._ours_is_direct:
             return self.obs_buf
         if env_ids is not None and len(env_ids) > 0:
             # PHC's reset squash step can leave stale forces in the refreshed view.
             self._contact_forces[env_ids] = 0.0
         reference, reference_frames = self._ours_reference_motion()
         frames = self._ours_frames()
-        teacher_body_observation = self._compute_humanoid_obs()
-        teacher = self._ours_teacher(reference, teacher_body_observation)
+        # Teacher input frames do not depend on the mode, so both modes fill
+        # them and the residual path keeps its existing frame assertion.
+        teacher_times = (
+            (self.progress_buf.float() + self._ours_teacher_frame_offset) * self.dt
+            + self._motion_start_times
+            + self._motion_start_times_offset
+        )
+        self._ours_teacher_input_frames = torch.round(
+            teacher_times * float(self._target_qpos_fps)
+        ).long().clamp(0, self._ours_ref_max_frame() - 1)
+        teacher_active = not self._ours_is_direct
+        if teacher_active:
+            teacher_body_observation = self._compute_humanoid_obs()
+            teacher = self._ours_teacher(
+                reference, teacher_body_observation, teacher_times
+            )
+        else:
+            # No tracker action exists. The observation width and structure stay
+            # identical: build_observation writes this slot as zeros.
+            teacher = torch.zeros_like(self._dof_pos)
         # The Studio PHC-X teacher keeps its native local-root self observation,
         # while the reference residual actor was trained with localRootObs=False.
         # Only the root-rotation encoding differs; all tensors remain Studio-owned.
@@ -1199,9 +1246,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         expected_teacher_frames = (
             frames + self._ours_teacher_frame_offset
         ).clamp(0, self._ours_ref_max_frame() - 1)
-        if (
-            not torch.equal(frames, reference_frames)
-            or not torch.equal(expected_teacher_frames, self._ours_teacher_input_frames)
+        if not torch.equal(frames, reference_frames) or (
+            teacher_active
+            and not torch.equal(
+                expected_teacher_frames, self._ours_teacher_input_frames
+            )
         ):
             raise RuntimeError("ours state/reference/teacher frames diverged")
         object_links = torch.stack((
@@ -1251,7 +1300,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         return observation
 
     def pre_physics_step(self, actions):
-        if not hasattr(self, "_ours_pnn"):
+        if not self._ours_is_direct:
             return super().pre_physics_step(actions)
         residual = actions.to(self.device)
         if self._ours_diagnostic_zero_residual:
@@ -1267,9 +1316,17 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 self._ours_action_replay_index += 1
             elif len(self._ours_closed_loop_rows) < self._ours_closed_loop_trace_steps:
                 raise RuntimeError("bounded action replay ended before the requested trace")
-        final = compose_residual_action(
-            self._ours_teacher_action, residual, self._ours_residual_scale
-        )
+        if self._ours_is_direct:
+            # direct: the policy action IS the final action. No clamp and no
+            # scaling are added here and the PHC action -> PD target contract is
+            # untouched. The existing rl-games clip_actions (default True) still
+            # applies outside this env; it belongs to the shared action contract
+            # and is deliberately left alone.
+            final = residual
+        else:
+            final = compose_residual_action(
+                self._ours_teacher_action, residual, self._ours_residual_scale
+            )
         if self._ours_final_action_replay is not None:
             if self._ours_batch_replay:
                 if self._ours_final_action_replay_index:
@@ -1299,13 +1356,20 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 self._ours_root_body_id, self._ours_child_body_id,
             ]]
             self._ours_batch_step_pre.update({
-                "teacher_observation": self._ours_numpy(
-                    self._ours_teacher_observation
+                **(
+                    {
+                        "teacher_observation": self._ours_numpy(
+                            self._ours_teacher_observation
+                        ),
+                        "teacher_normalized_observation": self._ours_numpy(
+                            self._ours_teacher_normalized_observation
+                        ),
+                        "teacher_action": self._ours_numpy(
+                            self._ours_teacher_action
+                        ),
+                    }
+                    if hasattr(self, "_ours_teacher_action") else {}
                 ),
-                "teacher_normalized_observation": self._ours_numpy(
-                    self._ours_teacher_normalized_observation
-                ),
-                "teacher_action": self._ours_numpy(self._ours_teacher_action),
                 "residual_action": self._ours_numpy(residual.clamp(-1.0, 1.0)),
                 "final_action": self._ours_numpy(final),
                 "pd_target": self._ours_numpy(self._action_to_pd_targets(final)),
@@ -1793,7 +1857,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             )
 
     def _compute_reset(self):
-        if not hasattr(self, "_ours_pnn"):
+        if not self._ours_is_direct:
             return super()._compute_reset()
         if not torch.isfinite(self.obs_buf).all():
             raise FloatingPointError("ours observation contains NaN/Inf")
@@ -2141,13 +2205,20 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         row = {
             "pre_frame": self._ours_numpy(self._ours_reference_lookup_frames[0]),
             "pre_observation": self._ours_numpy(self.obs_buf[0]),
-            "teacher_observation": self._ours_numpy(
-                self._ours_teacher_observation[0]
+            **(
+                {
+                    "teacher_observation": self._ours_numpy(
+                        self._ours_teacher_observation[0]
+                    ),
+                    "teacher_normalized_observation": self._ours_numpy(
+                        self._ours_teacher_normalized_observation[0]
+                    ),
+                    "teacher_action": self._ours_numpy(
+                        self._ours_teacher_action[0]
+                    ),
+                }
+                if hasattr(self, "_ours_teacher_action") else {}
             ),
-            "teacher_normalized_observation": self._ours_numpy(
-                self._ours_teacher_normalized_observation[0]
-            ),
-            "teacher_action": self._ours_numpy(self._ours_teacher_action[0]),
             "residual_action": self._ours_numpy(residual.clamp(-1.0, 1.0)[0]),
             "final_action": self._ours_numpy(final[0]),
             "pd_target": self._ours_numpy(pd_target[0]),
@@ -2255,7 +2326,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
 
     def post_physics_step(self):
         super().post_physics_step()
-        if not hasattr(self, "_ours_pnn"):
+        if not self._ours_is_direct:
             return
         self._ours_capture_evaluation_telemetry()
         self._ours_capture_trace()
