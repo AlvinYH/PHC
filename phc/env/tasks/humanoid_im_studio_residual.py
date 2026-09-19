@@ -167,11 +167,17 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_batch_substeps = None
         self._ours_prepare_files()
         reference_contact = np.asarray(self._ours_reference_np["contact_labels"])
+        if reference_contact.ndim == 3:
+            # Multi-trajectory: bound the pre-contact start from trajectory zero.
+            reference_contact = reference_contact[0]
         contact_frames = np.flatnonzero(np.any(reference_contact, axis=1))
         self._ours_first_contact_frame = (
             None if len(contact_frames) == 0 else int(contact_frames[0])
         )
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
+        if self._ours_num_traj > 1:
+            # Reuse MotionLib's per-env motion ids as the trajectory index.
+            self._ours_traj_id = (self._sampled_motion_ids % self._ours_num_traj).long()
         self._ours_opening_q_sum = torch.zeros(
             (), dtype=torch.float64, device=self.device,
         )
@@ -211,28 +217,82 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             dof_vel, **kwargs,
         )
 
-    def _object_reference_state_at_times(self, motion_times):
+    def _ours_ref_frame(self, tensor, frames, env_ids=None):
+        """Per-frame lookup for [T,...] or [N,T,...] reference tensors."""
+        if self._ours_num_traj == 1:
+            return tensor[frames]
+        traj = self._ours_traj_id if env_ids is None else self._ours_traj_id[env_ids]
+        return tensor[traj, frames]
+
+    def _ours_ref_max_frame(self):
+        """Number of frames in the (possibly multi-trajectory) reference."""
+        return (
+            self._ours_ref_root_state.shape[1]
+            if self._ours_num_traj > 1
+            else self._ours_ref_root_state.shape[0]
+        )
+
+    def _ours_ref_frame_links(self, frames, link_index):
+        """Per-frame + per-link lookup for [T,B,D] or [N,T,B,D] reference links."""
+        if self._ours_num_traj == 1:
+            return self._ours_ref_all_links[frames, link_index]
+        return self._ours_ref_all_links[self._ours_traj_id, frames, link_index]
+
+    def _target_qpos_ref_for_frames(self, frame_indices):
+        if self._ours_num_traj == 1:
+            return super()._target_qpos_ref_for_frames(frame_indices)
+        frames = torch.clamp(
+            frame_indices.long(), 0, self._target_joint_qpos.shape[1] - 1
+        )
+        if frames.shape[0] == self.num_envs:
+            return self._target_joint_qpos[self._ours_traj_id, frames]
+        # Reset subsets use trajectory zero's joint profile as the common start.
+        return self._target_joint_qpos[0, frames]
+
+    def _contact_ref_for_frames(self, frame_indices):
+        if self._ours_num_traj == 1:
+            return super()._contact_ref_for_frames(frame_indices)
+        n = int(frame_indices.shape[0])
+        frames = torch.clamp(
+            frame_indices.long(), 0, self._phc_contact_labels_10.shape[1] - 1
+        )
+        full = frames.shape[0] == self.num_envs
+        traj = self._ours_traj_id if full else torch.zeros_like(frames)
+        labels = self._phc_contact_labels_10[traj, frames]
+        contact_obj = self._phc_contact_obj_ref[traj, frames].reshape(n, -1).max(dim=-1).values
+        return labels, contact_obj
+
+    def _object_reference_state_at_times(self, motion_times, env_ids=None):
         """Look up the object reference at the same continuous time as the human."""
 
+        max_frame = (
+            self._ours_ref_root_state.shape[-2]
+            if self._ours_num_traj > 1
+            else self._ours_ref_root_state.shape[0]
+        )
         frame = (
             motion_times * float(self._target_qpos_fps)
-        ).clamp(0.0, float(self._ours_ref_root_state.shape[0] - 1))
+        ).clamp(0.0, float(max_frame - 1))
         lower = torch.floor(frame).long()
-        upper = (lower + 1).clamp(max=self._ours_ref_root_state.shape[0] - 1)
+        upper = (lower + 1).clamp(max=max_frame - 1)
         blend = (frame - lower.to(frame)).unsqueeze(-1)
 
-        root_lower = self._ours_ref_root_state[lower]
-        root_upper = self._ours_ref_root_state[upper]
+        root_lower = self._ours_ref_frame(self._ours_ref_root_state, lower, env_ids)
+        root_upper = self._ours_ref_frame(self._ours_ref_root_state, upper, env_ids)
         root_state = torch.cat((
             torch.lerp(root_lower[:, :3], root_upper[:, :3], blend),
             slerp(root_lower[:, 3:7], root_upper[:, 3:7], blend),
             torch.lerp(root_lower[:, 7:], root_upper[:, 7:], blend),
         ), dim=-1)
         qpos = torch.lerp(
-            self._target_joint_qpos[lower], self._target_joint_qpos[upper], blend,
+            self._ours_ref_frame(self._target_joint_qpos, lower, env_ids),
+            self._ours_ref_frame(self._target_joint_qpos, upper, env_ids),
+            blend,
         )
         qvel = torch.lerp(
-            self._target_joint_qvel[lower], self._target_joint_qvel[upper], blend,
+            self._ours_ref_frame(self._target_joint_qvel, lower, env_ids),
+            self._ours_ref_frame(self._target_joint_qvel, upper, env_ids),
+            blend,
         )
         return root_state, qpos, qvel
 
@@ -243,15 +303,20 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             + self._motion_start_times_offset[env_ids]
         )
         root_state, qpos, qvel = self._object_reference_state_at_times(
-            motion_times,
+            motion_times, env_ids,
         )
         self._target_states[env_ids] = root_state
         self._target_dof_pos[env_ids] = qpos
         self._target_dof_vel[env_ids] = qvel
         self._target_last_reset_joint_qpos[env_ids] = qpos
+        max_frame = (
+            self._ours_ref_root_state.shape[-2]
+            if self._ours_num_traj > 1
+            else self._ours_ref_root_state.shape[0]
+        )
         self._target_last_reset_reference_frame[env_ids] = torch.floor(
             motion_times * float(self._target_qpos_fps),
-        ).long().clamp(0, self._ours_ref_root_state.shape[0] - 1)
+        ).long().clamp(0, max_frame - 1)
         if self._ours_reset_replay_np is None or len(env_ids) == 0:
             return
         if not self._ours_batch_replay and (
@@ -490,6 +555,13 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             if missing:
                 raise ValueError("Studio articulated reference lacks: " + ", ".join(missing))
             self._ours_reference_np = {name: np.asarray(data[name]) for name in needed}
+        # Multi-trajectory references stack the per-frame fields to
+        # [num_traj, T, ...].  Single-trajectory references keep [T, ...].
+        qpos = self._ours_reference_np["object_joint_qpos"]
+        self._ours_num_traj = int(qpos.shape[0]) if qpos.ndim == 3 else 1
+        if self._ours_num_traj < 1:
+            raise ValueError("Studio articulated reference has no trajectories")
+        self._ours_traj_id = None
         mode_value = self._ours_reference_np["object_surface_mode"]
         if mode_value.size != 1:
             raise ValueError("Studio object_surface_mode must be scalar")
@@ -504,10 +576,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_child_link = str(self._ours_reference_np["active_child_link_names"].reshape(-1)[0])
         qpos = self._ours_reference_np["object_joint_qpos"]
         qvel = self._ours_reference_np["object_joint_qvel"]
-        if qpos.ndim != 2 or qvel.shape != qpos.shape or qpos.shape[0] < 2:
+        joint_axis = qpos.ndim - 1
+        if qpos.ndim not in (2, 3) or qvel.shape != qpos.shape or qpos.shape[-2] < 2:
             raise ValueError("Studio qpos/qvel reference must be aligned [T,J]")
         self._ours_reference_joint_names = tuple(str(name) for name in self._ours_reference_np["joint_names"].reshape(-1))
-        if len(self._ours_reference_joint_names) != qpos.shape[1] or active[0] not in self._ours_reference_joint_names:
+        if len(self._ours_reference_joint_names) != qpos.shape[joint_axis] or active[0] not in self._ours_reference_joint_names:
             raise ValueError("Studio joint names do not resolve the active qpos/qvel column")
         self._ours_action_replay_np = None
         if self._ours_action_replay_path is not None:
@@ -632,15 +705,29 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         labels_hand2 = np.asarray(
             self._ours_reference_np["contact_labels"], dtype=np.float32
         )
-        if labels_hand2.shape != (self._target_joint_qpos.shape[0], 2):
-            raise ValueError("Studio contact labels must align with object qpos")
-        labels = np.concatenate(
-            (
-                np.repeat(labels_hand2[:, 0:1], 5, axis=1),
-                np.repeat(labels_hand2[:, 1:2], 5, axis=1),
-            ),
-            axis=1,
-        )
+        multi = labels_hand2.ndim == 3
+        if multi:
+            if labels_hand2.shape[1:] != (self._target_joint_qpos.shape[1], 2):
+                raise ValueError("Studio contact labels must align with object qpos")
+            labels = np.concatenate(
+                (
+                    np.repeat(labels_hand2[..., 0:1], 5, axis=-1),
+                    np.repeat(labels_hand2[..., 1:2], 5, axis=-1),
+                ),
+                axis=-1,
+            )
+            obj_ref = np.any(labels_hand2 > 0.5, axis=-1, keepdims=True).astype(np.float32)
+        else:
+            if labels_hand2.shape != (self._target_joint_qpos.shape[0], 2):
+                raise ValueError("Studio contact labels must align with object qpos")
+            labels = np.concatenate(
+                (
+                    np.repeat(labels_hand2[:, 0:1], 5, axis=1),
+                    np.repeat(labels_hand2[:, 1:2], 5, axis=1),
+                ),
+                axis=1,
+            )
+            obj_ref = np.any(labels_hand2 > 0.5, axis=1, keepdims=True).astype(np.float32)
         self._phc_contact_labels_10 = torch.tensor(
             labels, dtype=torch.float32, device=self.device
         )
@@ -648,9 +735,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             labels_hand2, dtype=torch.float32, device=self.device
         )
         self._phc_contact_obj_ref = torch.tensor(
-            np.any(labels_hand2 > 0.5, axis=1, keepdims=True).astype(np.float32),
-            dtype=torch.float32,
-            device=self.device,
+            obj_ref, dtype=torch.float32, device=self.device
         )
 
     def _load_target_joint_qpos(self):
@@ -659,21 +744,34 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         qpos = np.asarray(self._ours_reference_np["object_joint_qpos"], dtype=np.float32)
         qvel = np.asarray(self._ours_reference_np["object_joint_qvel"], dtype=np.float32)
         names = list(self._ours_reference_joint_names)
-        if qpos.ndim != 2 or not len(qpos) or not np.isfinite(qpos).all():
-            raise ValueError("Studio object qpos must be finite [T,J]")
+        multi = qpos.ndim == 3
+        if multi:
+            if qpos.shape[1] < 1 or not np.isfinite(qpos).all():
+                raise ValueError("Studio object qpos must be finite [N,T,J]")
+            joint_axis = 2
+        else:
+            if qpos.ndim != 2 or not len(qpos) or not np.isfinite(qpos).all():
+                raise ValueError("Studio object qpos must be finite [T,J]")
+            joint_axis = 1
         if qvel.shape != qpos.shape or not np.isfinite(qvel).all():
-            raise ValueError("Studio object qvel must be finite [T,J]")
-        if names != list(self._target_joint_names) or qpos.shape[1] != len(names):
+            raise ValueError("Studio object qvel must match qpos")
+        if names != list(self._target_joint_names) or qpos.shape[joint_axis] != len(names):
             raise ValueError("Studio object qpos joint names disagree with PHC config")
         dof_indices = []
         for name in names:
             if name not in self._target_asset_dof_names:
                 raise ValueError(f"Studio object joint is missing from asset: {name}")
             dof_indices.append(self._target_asset_dof_names.index(name))
-        full_qpos = np.zeros((qpos.shape[0], self._target_max_dof), dtype=np.float32)
-        full_qpos[:, dof_indices] = qpos
-        full_qvel = np.zeros((qvel.shape[0], self._target_max_dof), dtype=np.float32)
-        full_qvel[:, dof_indices] = qvel
+        if multi:
+            full_qpos = np.zeros((qpos.shape[0], qpos.shape[1], self._target_max_dof), dtype=np.float32)
+            full_qpos[:, :, dof_indices] = qpos
+            full_qvel = np.zeros((qvel.shape[0], qvel.shape[1], self._target_max_dof), dtype=np.float32)
+            full_qvel[:, :, dof_indices] = qvel
+        else:
+            full_qpos = np.zeros((qpos.shape[0], self._target_max_dof), dtype=np.float32)
+            full_qpos[:, dof_indices] = qpos
+            full_qvel = np.zeros((qvel.shape[0], self._target_max_dof), dtype=np.float32)
+            full_qvel[:, dof_indices] = qvel
         self._target_active_dof_indices = torch.tensor(
             dof_indices, dtype=torch.long, device=self.device
         )
@@ -700,7 +798,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             raise ValueError("Studio active joint does not resolve in PHC object DOFs")
         if self._ours_reference_joint_names != tuple(self._target_joint_names):
             raise ValueError("Studio PHC and articulated references disagree on object joint order")
-        if self._ours_reference_np["object_joint_qpos"].shape[1] != len(self._target_joint_names):
+        if self._ours_reference_np["object_joint_qpos"].shape[-1] != len(self._target_joint_names):
             raise ValueError("Studio qpos reference and PHC object-joint order differ")
         self._ours_active_reference_index = self._target_joint_names.index(self._ours_active_joint_name)
         self._ours_active_dof = self._target_asset_dof_names.index(self._ours_active_joint_name)
@@ -791,14 +889,19 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             str(name) for name in ref["finger_contact_body_names"].reshape(-1)
         )
         reference_finger = np.asarray(ref["finger_contact_labels"])
-        if (
-            reference_finger.shape != (self._target_joint_qpos.shape[0], 30)
-            or reference_finger.dtype != np.bool_
-        ):
+        multi = reference_finger.ndim == 3
+        expected = (
+            (self._target_joint_qpos.shape[1], 30)
+            if multi
+            else (self._target_joint_qpos.shape[0], 30)
+        )
+        if reference_finger.shape[-2:] != expected or reference_finger.dtype != np.bool_:
             raise ValueError("Studio finger contact labels must be bool [T,30]")
         reference_finger_order = canonical_finger_segment_order(reference_finger_names)
         self._ours_finger_contact_reference = torch.tensor(
-            reference_finger[:, reference_finger_order],
+            reference_finger[:, :, reference_finger_order]
+            if multi
+            else reference_finger[:, reference_finger_order],
             dtype=torch.bool,
             device=self.device,
         )
@@ -820,11 +923,19 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         if set(reference_names) != set(object_names) or len(reference_names) != len(object_names):
             raise ValueError("Studio reference and PHC object body maps differ")
         reference_order = [reference_names.index(name) for name in object_names]
+        multi = self._ours_num_traj > 1
+        if multi:
+            link_pos = ref["object_link_pos"][:, :, reference_order]
+            link_rot = ref["object_link_rot_xyzw"][:, :, reference_order]
+            link_vel = ref["object_link_vel"][:, :, reference_order]
+            link_ang_vel = ref["object_link_ang_vel"][:, :, reference_order]
+        else:
+            link_pos = ref["object_link_pos"][:, reference_order]
+            link_rot = ref["object_link_rot_xyzw"][:, reference_order]
+            link_vel = ref["object_link_vel"][:, reference_order]
+            link_ang_vel = ref["object_link_ang_vel"][:, reference_order]
         self._ours_ref_all_links = torch.tensor(np.concatenate((
-            ref["object_link_pos"][:, reference_order],
-            ref["object_link_rot_xyzw"][:, reference_order],
-            ref["object_link_vel"][:, reference_order],
-            ref["object_link_ang_vel"][:, reference_order],
+            link_pos, link_rot, link_vel, link_ang_vel,
         ), axis=-1), dtype=torch.float32, device=self.device)
         self._ours_ref_root_state = torch.tensor(np.concatenate((
             ref["object_root_pos"], ref["object_root_rot_xyzw"],
@@ -838,6 +949,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         surface_points = np.asarray(
             ref["collision_surface_points_link_local_scaled"], dtype=np.float32
         )
+        if surface_points.ndim == 3:
+            # Multi-trajectory: contact geometry follows trajectory zero's scale.
+            surface_points = surface_points[0]
         contact_points = np.asarray(
             self._phc_object_config["contact_region_points"], dtype=np.float32
         )
@@ -890,7 +1004,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ):
             raise ValueError("Studio finger contact surface must include active and fixed links")
         self._ours_finger_surface_points_local = torch.tensor(
-            ref["finger_contact_surface_points_link_local_scaled"],
+            ref["finger_contact_surface_points_link_local_scaled"][0]
+            if np.asarray(ref["finger_contact_surface_points_link_local_scaled"]).ndim == 3
+            else ref["finger_contact_surface_points_link_local_scaled"],
             dtype=torch.float32,
             device=self.device,
         )
@@ -909,7 +1025,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                         "Studio part-aware finger surface has fewer points than part KNN count"
                     )
         self._ours_bbox = torch.tensor(
-            np.concatenate((ref["policy_root_bbox"], ref["policy_active_child_bbox"]), axis=0),
+            np.concatenate(
+                (ref["policy_root_bbox"], ref["policy_active_child_bbox"]), axis=0,
+            )[0] if np.asarray(ref["policy_root_bbox"]).ndim == 4 else np.concatenate(
+                (ref["policy_root_bbox"], ref["policy_active_child_bbox"]), axis=0,
+            ),
             dtype=torch.float32,
             device=self.device,
         )
@@ -930,7 +1050,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_mean = checkpoint["running_mean_std"]["running_mean"].float().to(self.device)
         self._ours_var = checkpoint["running_mean_std"]["running_var"].float().to(self.device)
 
-        qref = self._target_joint_qpos[:, self._ours_active_dof:self._ours_active_dof + 1]
+        if self._ours_num_traj > 1:
+            # Progress phase boundaries follow trajectory zero's joint profile;
+            # the active-joint angle is scale-invariant across trajectories.
+            qref = self._target_joint_qpos[0, :, self._ours_active_dof:self._ours_active_dof + 1]
+        else:
+            qref = self._target_joint_qpos[:, self._ours_active_dof:self._ours_active_dof + 1]
         phase = build_phase_progress_tables(qref.detach().cpu().numpy())
         self._ours_phase_start = torch.tensor(phase[0], dtype=torch.long, device=self.device)
         self._ours_phase_target = torch.tensor(phase[1], dtype=torch.float32, device=self.device)
@@ -1000,12 +1125,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         # Same-frame lookup is deliberate; PHC's generic task observation uses t+1.
         motion_times = self.progress_buf.float() * self.dt + self._motion_start_times + self._motion_start_times_offset
         reference = self._get_state_from_motionlib_cache(self._sampled_motion_ids, motion_times, self._global_offset)
-        frames = torch.round(motion_times * float(self._target_qpos_fps)).long().clamp(0, self._ours_ref_root_state.shape[0] - 1)
+        frames = torch.round(motion_times * float(self._target_qpos_fps)).long().clamp(0, self._ours_ref_max_frame() - 1)
         return reference, frames
 
     def _ours_frames(self):
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
-        return self._target_frame_indices(env_ids).clamp(0, self._ours_ref_root_state.shape[0] - 1)
+        return self._target_frame_indices(env_ids).clamp(0, self._ours_ref_max_frame() - 1)
 
     def _ours_teacher(self, reference, body_observation):
         teacher_times = (
@@ -1015,7 +1140,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
         self._ours_teacher_input_frames = torch.round(
             teacher_times * float(self._target_qpos_fps)
-        ).long().clamp(0, self._ours_ref_root_state.shape[0] - 1)
+        ).long().clamp(0, self._ours_ref_max_frame() - 1)
         if self._ours_teacher_frame_offset:
             reference = self._get_state_from_motionlib_cache(
                 self._sampled_motion_ids, teacher_times, self._global_offset,
@@ -1073,7 +1198,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
         expected_teacher_frames = (
             frames + self._ours_teacher_frame_offset
-        ).clamp(0, self._ours_ref_root_state.shape[0] - 1)
+        ).clamp(0, self._ours_ref_max_frame() - 1)
         if (
             not torch.equal(frames, reference_frames)
             or not torch.equal(expected_teacher_frames, self._ours_teacher_input_frames)
@@ -1087,8 +1212,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         active_reference = self._target_qpos_ref_for_frames(frames)[:, self._ours_active_dof:self._ours_active_dof + 1]
         # GT actor root 与 GT active child 沿用 live object_links 的同一双-slot 顺序。
         reference_object_links = torch.stack((
-            self._ours_ref_root_state[frames],
-            self._ours_ref_all_links[frames, self._ours_child_object_index],
+            self._ours_ref_frame(self._ours_ref_root_state, frames),
+            self._ours_ref_frame_links(frames, self._ours_child_object_index),
         ), dim=1)
         observation = build_observation(
             human={
@@ -1109,7 +1234,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "active_qpos": active_reference,
                 "human_root_pos": reference["rg_pos"][:, 0],
                 "human_root_rot": reference["rb_rot"][:, 0],
-                "object_root_state": self._ours_ref_root_state[frames],
+                "object_root_state": self._ours_ref_frame(self._ours_ref_root_state, frames),
                 "object_link_state": reference_object_links,
             },
             teacher_action=teacher,
@@ -1274,9 +1399,17 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         }
 
     def _ours_world_surface_points(self, object_link_state):
-        link_state = object_link_state.index_select(1, self._ours_surface_link_ids)
-        points = self._ours_surface_points_local.unsqueeze(0).expand(object_link_state.shape[0], -1, -1)
-        world = quat_apply(link_state[..., 3:7].reshape(-1, 4), points.reshape(-1, 3)).reshape(object_link_state.shape[0], -1, 3)
+        dim = object_link_state.ndim - 2  # link axis (B)
+        link_state = object_link_state.index_select(dim, self._ours_surface_link_ids)
+        points = self._ours_surface_points_local
+        batch_shape = link_state.shape[:dim]
+        expanded = points.view(
+            (1,) * len(batch_shape) + points.shape,
+        ).expand(batch_shape + points.shape)
+        world = quat_apply(
+            link_state[..., 3:7].reshape(-1, 4),
+            expanded.reshape(-1, 3),
+        ).reshape(batch_shape + points.shape)
         return world + link_state[..., :3]
 
     def _ours_world_finger_contact_surface(self, object_link_state):
@@ -1314,16 +1447,16 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         active = self._target_dof_pos[:, self._ours_active_dof:self._ours_active_dof + 1]
         active_reference = self._target_qpos_ref_for_frames(frames)[:, self._ours_active_dof:self._ours_active_dof + 1]
         active_velocity = self._target_dof_vel[:, self._ours_active_dof:self._ours_active_dof + 1]
-        reference_velocity = self._target_joint_qvel[
-            frames, self._ours_active_dof:self._ours_active_dof + 1,
-        ]
+        reference_velocity = self._ours_ref_frame(
+            self._target_joint_qvel, frames,
+        )[..., self._ours_active_dof:self._ours_active_dof + 1]
         actual_contact = body_contact_indicator(self._contact_forces)
         current_links = self._rigid_body_state_reshaped[:, self._ours_all_object_ids]
         current_surface = self._ours_world_surface_points(current_links)
         full_object_surface = self._ours_world_finger_contact_surface(current_links)
         finger_state = self._rigid_body_state_reshaped[:, self._ours_finger_ids]
-        reference_finger_contact = self._ours_finger_contact_reference[frames]
-        reference_hand_contact = self._phc_contact_labels_hand2[frames].bool()
+        reference_finger_contact = self._ours_ref_frame(self._ours_finger_contact_reference, frames)
+        reference_hand_contact = self._ours_ref_frame(self._phc_contact_labels_hand2, frames).bool()
         part_aware = self._ours_part_aware_contact_reward_enabled
         if self._ours_needs_part_attribution:
             if self._ours_active_joint_torque_enabled:
@@ -1403,9 +1536,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         previous_phase_completion = phase_relative_progress(
             self._ours_previous_active_qpos,
             self._ours_progress_phase_entry_qpos,
-            self._target_joint_qpos[
-                previous_phase_index, self._ours_active_dof
-            ],
+            self._ours_ref_frame(
+                self._target_joint_qpos, previous_phase_index,
+            )[..., self._ours_active_dof],
             self._ours_phase_target[previous_phase_index, 0],
             self._ours_phase_direction[previous_phase_index, 0],
             self._ours_progress_phase_start >= 0,
@@ -1426,9 +1559,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_previous_active_qpos,
             self._ours_progress_phase_entry_qpos,
         )
-        reference_start_qpos = self._target_joint_qpos[
-            phase_start, self._ours_active_dof
-        ]
+        reference_start_qpos = self._ours_ref_frame(
+            self._target_joint_qpos, phase_start,
+        )[..., self._ours_active_dof]
         phase_completion = phase_relative_progress(
             active[:, 0],
             phase_entry_qpos,
@@ -1463,9 +1596,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         acceleration_valid = frames - episode_start > 2
         acceleration_scale = float(self._target_qpos_fps)
         active_link_state = current_links[:, self._ours_child_object_index]
-        reference_active_link_state = self._ours_ref_all_links[
-            frames, self._ours_child_object_index
-        ]
+        reference_active_link_state = self._ours_ref_frame_links(
+            frames, self._ours_child_object_index,
+        )
         contact = {
             "reference_hand_contact": reference_hand_contact,
             "reference_finger_contact": reference_finger_contact,
@@ -1524,13 +1657,13 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "reference_body_rot": reference["rb_rot"],
                 "reference_body_vel": reference["body_vel"],
                 "reference_body_ang_vel": reference["body_ang_vel"],
-                "reference_surface_points": self._ours_reference_surface[frames],
+                "reference_surface_points": self._ours_ref_frame(self._ours_reference_surface, frames),
                 "dof_acceleration": (self._dof_vel - self._ours_previous_dof_velocity) * acceleration_scale,
                 "acceleration_valid": acceleration_valid,
             },
             object_state={
                 "root_state": self._target_states,
-                "reference_root_state": self._ours_ref_root_state[frames],
+                "reference_root_state": self._ours_ref_frame(self._ours_ref_root_state, frames),
                 "linear_acceleration": (self._target_states[:, 7:10] - self._ours_previous_object_linear_velocity) * acceleration_scale,
                 "angular_acceleration": (self._target_states[:, 10:13] - self._ours_previous_object_angular_velocity) * acceleration_scale,
                 "active_link_state": active_link_state,
@@ -1570,7 +1703,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._rigid_body_pos,
             reference["rg_pos"],
             current_surface,
-            self._ours_reference_surface[frames],
+            self._ours_ref_frame(self._ours_reference_surface, frames),
             actual_contact,
             torch.zeros_like(actual_contact),
             self._ours_reward_indices,
@@ -1686,7 +1819,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
 
         # 训练沿用全部失败 reset；fixed-horizon 评测只记录失败，不重置轨迹。
         failed = (kinematic | contact | root_fall) & self._enable_early_termination
-        end_of_motion = frames >= self._ours_ref_root_state.shape[0] - 1
+        end_of_motion = frames >= self._ours_ref_max_frame() - 1
         end_of_rollout = self.progress_buf >= self.max_episode_length - 1
         self._ours_reset_reason_root_fall = root_fall & self._enable_early_termination
         self._ours_reset_reason_kinematic = kinematic
@@ -1857,12 +1990,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         if self._ours_trace_path is None or len(self._ours_trace_rows) >= 64:
             return
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
-        physics_frames = self._target_frame_indices(env_ids).clamp(0, self._ours_ref_root_state.shape[0] - 1)
+        physics_frames = self._target_frame_indices(env_ids).clamp(0, self._ours_ref_max_frame() - 1)
         reference_frames = self._ours_reference_lookup_frames
         teacher_frames = self._ours_teacher_input_frames
         expected_teacher_frames = (
             physics_frames + self._ours_teacher_frame_offset
-        ).clamp(0, self._ours_ref_root_state.shape[0] - 1)
+        ).clamp(0, self._ours_ref_max_frame() - 1)
         if (
             not torch.equal(physics_frames, reference_frames)
             or not torch.equal(expected_teacher_frames, teacher_frames)
@@ -2084,7 +2217,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         rollout["ours_evaluation"] = {
             "reference_frame": frames.detach().cpu().numpy(),
             "reference_body_state": reference_body_state.detach().cpu().numpy(),
-            "finger_reference_contact": self._ours_finger_contact_reference[frames].detach().cpu().numpy(),
+            "finger_reference_contact": self._ours_ref_frame(self._ours_finger_contact_reference, frames).detach().cpu().numpy(),
             "finger_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             "finger_contact_force": force.detach().cpu().numpy(),
             "finger_object_distance": self._ours_finger_object_distance.detach().cpu().numpy(),
