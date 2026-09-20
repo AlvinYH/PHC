@@ -1205,7 +1205,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
 
     def _compute_observations(self, env_ids=None):
-        if not self._ours_is_direct:
+        if not hasattr(self, "_ours_pnn"):
             return self.obs_buf
         if env_ids is not None and len(env_ids) > 0:
             # PHC's reset squash step can leave stale forces in the refreshed view.
@@ -1300,8 +1300,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         return observation
 
     def pre_physics_step(self, actions):
-        if not self._ours_is_direct:
-            return super().pre_physics_step(actions)
         residual = actions.to(self.device)
         if self._ours_diagnostic_zero_residual:
             residual = torch.zeros_like(residual)
@@ -1857,7 +1855,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             )
 
     def _compute_reset(self):
-        if not self._ours_is_direct:
+        if not hasattr(self, "_ours_pnn"):
             return super()._compute_reset()
         if not torch.isfinite(self.obs_buf).all():
             raise FloatingPointError("ours observation contains NaN/Inf")
@@ -2326,7 +2324,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
 
     def post_physics_step(self):
         super().post_physics_step()
-        if not self._ours_is_direct:
+        if not hasattr(self, "_ours_pnn"):
             return
         self._ours_capture_evaluation_telemetry()
         self._ours_capture_trace()
