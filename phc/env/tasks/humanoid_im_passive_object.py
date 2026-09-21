@@ -270,35 +270,32 @@ class HumanoidImPassiveObject(HumanoidIm):
         )
     @staticmethod
     def _load_contact_region_points(object_config: dict):
-        path = Path(object_config["contact_region_points_path"]).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"contact_region_points_path does not exist: {path}")
-        with np.load(str(path), allow_pickle=False) as payload:
-            required = {"points_link_local_scaled", "point_link_names"}
-            missing = sorted(required.difference(payload.files))
-            if missing:
-                raise ValueError(f"Missing contact-region point fields {missing} in {path}")
-            points = np.asarray(payload["points_link_local_scaled"], dtype=np.float32)
-            names = [str(value) for value in np.asarray(payload["point_link_names"]).reshape(-1).tolist()]
+        points = np.asarray(
+            object_config["contact_region_points"], dtype=np.float32
+        )
+        names = [
+            str(value)
+            for value in np.asarray(
+                object_config["contact_region_point_link_names"]
+            ).reshape(-1).tolist()
+        ]
         if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
-            raise ValueError(f"contact-region points must have shape (P,3), got {points.shape} in {path}")
+            raise ValueError(
+                f"contact-region points must have shape (P,3), got {points.shape}"
+            )
         if len(names) != int(points.shape[0]) or any(not name for name in names):
             raise ValueError(
-                f"contact-region point/link mismatch in {path}: "
+                "contact-region point/link mismatch: "
                 f"points={points.shape[0]}, names={len(names)}"
             )
         if not np.isfinite(points).all():
-            raise ValueError(f"contact-region points contain non-finite values: {path}")
+            raise ValueError("contact-region points contain non-finite values")
         return points, names
 
     def _load_contact_reference(self):
-        path = Path(self._phc_object_config["contact_reference_path"]).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"contact_reference_path does not exist: {path}")
-        with np.load(str(path), allow_pickle=False) as payload:
-            if set(payload.files) != {"labels"}:
-                raise ValueError(f"Contact reference must contain only labels: {path}")
-            labels_hand2 = np.asarray(payload["labels"], dtype=np.float32).reshape(-1, 2)
+        labels_hand2 = np.asarray(
+            self._phc_object_config["contact_labels"], dtype=np.float32
+        ).reshape(-1, 2)
         labels = np.concatenate(
             [
                 np.repeat(labels_hand2[:, 0:1], 5, axis=1),
@@ -318,7 +315,7 @@ class HumanoidImPassiveObject(HumanoidIm):
                 f"object={contact_obj.shape[0]}, labels={labels.shape[0]}"
             )
         if not np.isfinite(labels).all() or not np.isfinite(contact_obj).all():
-            raise ValueError(f"Contact reference contains non-finite values: {path}")
+            raise ValueError("Contact reference contains non-finite values")
         self._phc_contact_labels_10 = torch.tensor(
             labels, dtype=torch.float32, device=self.device
         )
@@ -651,24 +648,16 @@ class HumanoidImPassiveObject(HumanoidIm):
         return torch.tensor(ids, dtype=torch.long, device=self.device)
 
     def _load_target_joint_qpos(self):
-        qpos_path = Path(
-            self._phc_object_config["object_joint_qpos_reference_path"]
-        ).expanduser().resolve()
-        if not qpos_path.is_file():
-            raise FileNotFoundError(
-                f"object_joint_qpos_reference_path does not exist: {qpos_path}"
-            )
-        with np.load(str(qpos_path), allow_pickle=False) as payload:
-            qpos_np = np.asarray(payload["joint_qpos"], dtype=np.float32)
-            reference_joint_names = [
-                str(name) for name in np.asarray(payload["joint_names"]).tolist()
-            ]
+        qpos_np = np.asarray(
+            self._phc_object_config["object_reference_qpos"], dtype=np.float32
+        )
+        reference_joint_names = list(self._target_joint_names)
         if qpos_np.ndim != 2:
-            raise ValueError(f"joint_qpos must be (T, K), got {qpos_np.shape} from {qpos_path}")
+            raise ValueError(f"joint_qpos must be (T, K), got {qpos_np.shape}")
         if qpos_np.shape[0] == 0:
-            raise ValueError(f"joint_qpos must contain at least one frame: {qpos_path}")
+            raise ValueError("joint_qpos must contain at least one frame")
         if not np.isfinite(qpos_np).all():
-            raise ValueError(f"joint_qpos contains non-finite values: {qpos_path}")
+            raise ValueError("joint_qpos contains non-finite values")
         if qpos_np.shape[1] != len(reference_joint_names):
             raise ValueError(
                 f"joint_qpos width {qpos_np.shape[1]} does not match "
