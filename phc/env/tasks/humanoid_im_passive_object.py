@@ -734,10 +734,15 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._target_last_reset_joint_qpos[env_ids] = reset_qpos
         self._target_last_reset_reference_frame[env_ids] = frames
 
-    def _pad_target_dofs(self, tensor):
+    def _pad_target_dofs(self, tensor, position_targets=False):
         target_k = self._target_max_dof
         tensor = tensor.reshape(self.num_envs, -1)
         pad = torch.zeros((self.num_envs, target_k), dtype=tensor.dtype, device=tensor.device)
+        if position_targets and "robocasa_physics" in self._phc_object_config:
+            pad[:] = torch.as_tensor(
+                [joint["springref"] for joint in self._phc_object_config["robocasa_physics"]["joints"]],
+                dtype=tensor.dtype, device=tensor.device,
+            )
         return torch.cat([tensor, pad], dim=1).contiguous()
 
     def _reset_env_tensors(self, env_ids):
@@ -757,15 +762,17 @@ class HumanoidImPassiveObject(HumanoidIm):
             gymtorch.unwrap_tensor(combined_ids),
             len(combined_ids),
         )
+        position_targets = self._dof_state.view(
+            self.num_envs, self._dof_state.shape[0] // self.num_envs, 2,
+        )[..., 0].clone()
+        if "robocasa_physics" in self._phc_object_config:
+            position_targets[:, self.num_dof : self.num_dof + self._target_max_dof] = torch.as_tensor(
+                [joint["springref"] for joint in self._phc_object_config["robocasa_physics"]["joints"]],
+                dtype=position_targets.dtype, device=position_targets.device,
+            )
         self.gym.set_dof_position_target_tensor_indexed(
             self.sim,
-            gymtorch.unwrap_tensor(
-                self._dof_state.view(
-                    self.num_envs,
-                    self._dof_state.shape[0] // self.num_envs,
-                    2,
-                )[..., 0].contiguous()
-            ),
+            gymtorch.unwrap_tensor(position_targets.contiguous()),
             gymtorch.unwrap_tensor(combined_ids),
             len(combined_ids),
         )
@@ -860,7 +867,7 @@ class HumanoidImPassiveObject(HumanoidIm):
 
             self.gym.set_dof_position_target_tensor(
                 self.sim,
-                gymtorch.unwrap_tensor(self._pad_target_dofs(pd_tar)),
+                gymtorch.unwrap_tensor(self._pad_target_dofs(pd_tar, position_targets=True)),
             )
         else:
             if self.control_mode == "force":
