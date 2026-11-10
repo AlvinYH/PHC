@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from isaacgym import gymapi
@@ -39,7 +38,9 @@ class HumanoidImPassiveObject(HumanoidIm):
         if env_cfg["phcObjectTrackingMode"] != "passive_dynamic":
             raise ValueError("HumanoidImPassiveObject requires phcObjectTrackingMode=passive_dynamic")
 
-        object_config = json.loads(object_config_path.read_text(encoding="utf-8"))
+        from pipeline.physics.object_config import load_object_config
+
+        object_config = load_object_config(object_config_path)
         self._phc_object_config = object_config
         static_collision_filter = object_config.get("static_box_collision_filter", 0)
         if (
@@ -427,8 +428,10 @@ class HumanoidImPassiveObject(HumanoidIm):
         configs = [self._phc_object_config]
         if hasattr(self, "_ours_num_traj") and self._ours_num_traj > 1:
             case_root = self._ours_reference_path.parent / "phc" / "reference" / "cases"
+            from pipeline.physics.object_config import load_object_config
+
             configs = [
-                json.loads((case_root / f"traj_{index:02d}" / "phc_object_case" / "config.json").read_text(encoding="utf-8"))
+                load_object_config(case_root / f"traj_{index:02d}" / "phc_object_case" / "config.json")
                 for index in range(self._ours_num_traj)
             ]
         loaded = [load_articulated_asset(self.gym, self.sim, config) for config in configs]
