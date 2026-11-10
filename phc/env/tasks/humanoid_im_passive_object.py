@@ -268,6 +268,29 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._phc_hand_box_valid = torch.tensor(
             hand_box_valid, dtype=torch.bool, device=self.device
         )
+        if len(self._target_case_configs) > 1:
+            case_root = self._ours_reference_path.parent / "phc" / "reference" / "cases"
+            label_geometry, hand_geometry = [], []
+            for index in range(len(self._target_case_configs)):
+                case_path = case_root / f"traj_{index:02d}" / "humanoid.xml"
+                label_geometry.append(load_hand_collision_geometry(case_path, label_body_names))
+                hand_geometry.append(load_hand_collision_geometry(case_path, hand_names))
+            case_ids = np.arange(self.num_envs) % len(self._target_case_configs)
+            fields = (
+                ("_phc_contact_label_capsule_endpoints_local", label_geometry, 0),
+                ("_phc_contact_label_capsule_radii", label_geometry, 1),
+                ("_phc_contact_label_capsule_valid", label_geometry, 2),
+                ("_phc_hand_capsule_endpoints_local", hand_geometry, 0),
+                ("_phc_hand_capsule_radii", hand_geometry, 1),
+                ("_phc_hand_capsule_valid", hand_geometry, 2),
+                ("_phc_hand_box_centers_local", hand_geometry, 3),
+                ("_phc_hand_box_quaternions_local", hand_geometry, 4),
+                ("_phc_hand_box_half_extents", hand_geometry, 5),
+                ("_phc_hand_box_valid", hand_geometry, 6),
+            )
+            for name, geometry, field in fields:
+                values = np.stack([item[field] for item in geometry])[case_ids]
+                setattr(self, name, torch.as_tensor(values, device=self.device))
     @staticmethod
     def _load_contact_region_points(object_config: dict):
         points = np.asarray(
@@ -341,20 +364,21 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._target_handles = []
         self._target_static_box_handles = []
         self._load_target_asset()
+        from pipeline.physics.articulated_scene import load_static_box_assets
+        self._target_static_box_assets_by_case = [self._target_static_box_assets] + [
+            load_static_box_assets(self.gym, self.sim, config)
+            for config in self._target_case_configs[1:]
+        ]
         # The parent reserves each aggregate after it has loaded the humanoid
         # asset.  Give it the exact capacity contributed by this task's extra
         # actors instead of treating its historical default of 160 as a count
         # of humanoid bodies or shapes.  Static support boxes are actors too.
         target_bodies = int(self.gym.get_asset_rigid_body_count(self._target_asset))
         target_shapes = int(self.gym.get_asset_rigid_shape_count(self._target_asset))
-        static_bodies = sum(
-            int(self.gym.get_asset_rigid_body_count(asset))
-            for asset in self._target_static_box_assets
-        )
-        static_shapes = sum(
-            int(self.gym.get_asset_rigid_shape_count(asset))
-            for asset in self._target_static_box_assets
-        )
+        static_bodies = max(sum(int(self.gym.get_asset_rigid_body_count(asset)) for asset in assets)
+                            for assets in self._target_static_box_assets_by_case)
+        static_shapes = max(sum(int(self.gym.get_asset_rigid_shape_count(asset)) for asset in assets)
+                            for assets in self._target_static_box_assets_by_case)
         self._aggregate_extra_bodies = target_bodies + static_bodies
         self._aggregate_extra_shapes = target_shapes + static_shapes
         super()._create_envs(num_envs, spacing, num_per_row)
@@ -384,30 +408,49 @@ class HumanoidImPassiveObject(HumanoidIm):
         self._build_target(env_id, env_ptr)
         from pipeline.physics.articulated_scene import create_static_box_actors
 
+        case_index = env_id % len(self._target_case_configs)
+        object_config = self._target_case_configs[case_index]
         self._target_static_box_handles.extend(
             create_static_box_actors(
                 self.gym,
                 env_ptr,
                 env_id,
-                self._target_static_box_assets,
-                self._phc_object_config,
-                collision_filter=self._target_static_box_collision_filter,
+                self._target_static_box_assets_by_case[case_index],
+                object_config,
+                collision_filter=object_config["static_box_collision_filter"] if "static_box_collision_filter" in object_config else 0,
             )
         )
 
     def _load_target_asset(self):
         from pipeline.physics.articulated_scene import load_articulated_asset
 
-        self._target_asset, self._target_dof_properties = load_articulated_asset(
-            self.gym,
-            self.sim,
-            self._phc_object_config,
-        )
+        configs = [self._phc_object_config]
+        if hasattr(self, "_ours_num_traj") and self._ours_num_traj > 1:
+            case_root = self._ours_reference_path.parent / "phc" / "reference" / "cases"
+            configs = [
+                json.loads((case_root / f"traj_{index:02d}" / "phc_object_case" / "config.json").read_text(encoding="utf-8"))
+                for index in range(self._ours_num_traj)
+            ]
+        loaded = [load_articulated_asset(self.gym, self.sim, config) for config in configs]
+        self._target_assets = [item[0] for item in loaded]
+        self._target_dof_properties_by_case = [item[1] for item in loaded]
+        self._target_case_configs = configs
+        if len(configs) > 1:
+            self._phc_contact_region_names = tuple(dict.fromkeys(
+                name for config in configs for name in config["contact_region_body_names"]
+            ))
+        self._target_asset = self._target_assets[0]
+        self._target_dof_properties = self._target_dof_properties_by_case[0]
 
         self._target_asset_dof_count = int(self.gym.get_asset_dof_count(self._target_asset))
         self._target_asset_dof_names = [str(name) for name in self.gym.get_asset_dof_names(self._target_asset)]
         self._target_asset_body_count = int(self.gym.get_asset_rigid_body_count(self._target_asset))
         self._target_body_names = list(self.gym.get_asset_rigid_body_names(self._target_asset))
+        for asset in self._target_assets[1:]:
+            if (list(self.gym.get_asset_dof_names(asset)) != self._target_asset_dof_names
+                    or list(self.gym.get_asset_rigid_body_names(asset)) != self._target_body_names
+                    or self.gym.get_asset_rigid_shape_count(asset) != self.gym.get_asset_rigid_shape_count(self._target_asset)):
+                raise ValueError("Multi-case assets must share the same body, DOF and shape layout")
         if self._target_asset_dof_count == 0:
             raise RuntimeError("PHC-X Studio articulated object asset has no DOFs")
 
@@ -415,6 +458,8 @@ class HumanoidImPassiveObject(HumanoidIm):
         if self._target_asset is None:
             raise RuntimeError("Target asset must be loaded before building envs")
 
+        case_index = env_id % len(self._target_assets)
+        object_config = self._target_case_configs[case_index]
         default_pose = gymapi.Transform()
         create_at_identity = self.cfg["env"].get(
             "oursDiagnosticObjectActorCreationIdentity", False
@@ -425,11 +470,13 @@ class HumanoidImPassiveObject(HumanoidIm):
         ):
             raise ValueError("object actor creation-pose override is audit-only")
         if not create_at_identity:
+            root_pos = self._target_default_root_pos_np if len(self._target_assets) == 1 else object_config["target_default_root_pos"]
+            root_quat = self._target_default_root_quat_np if len(self._target_assets) == 1 else object_config["target_default_root_quat_xyzw"]
             default_pose.p = gymapi.Vec3(
-                *[float(v) for v in self._target_default_root_pos_np]
+                *[float(v) for v in root_pos]
             )
             default_pose.r = gymapi.Quat(
-                *[float(v) for v in self._target_default_root_quat_np]
+                *[float(v) for v in root_quat]
             )
 
         from pipeline.physics.articulated_scene import (
@@ -450,7 +497,7 @@ class HumanoidImPassiveObject(HumanoidIm):
 
         target_handle = self.gym.create_actor(
             env_ptr,
-            self._target_asset,
+            self._target_assets[case_index],
             default_pose,
             self._target_name,
             env_id,
@@ -461,12 +508,10 @@ class HumanoidImPassiveObject(HumanoidIm):
             self.gym,
             env_ptr,
             target_handle,
-            self._target_dof_properties,
-            self._phc_object_config,
+            self._target_dof_properties_by_case[case_index],
+            object_config,
         )
 
-        # The staged URDF meshes already contain the reconstruction scale.
-        self.gym.set_actor_scale(env_ptr, target_handle, 1.0)
         self._target_handles.append(target_handle)
 
     def _build_target_tensors(self):
@@ -542,21 +587,35 @@ class HumanoidImPassiveObject(HumanoidIm):
             dtype=torch.float32,
             device=self.device,
         )
-        self._phc_contact_region_point_body_local_ids = self._resolve_contact_region_point_body_local_ids()
-        self._phc_contact_region_point_indices = tuple(
-            torch.tensor(
-                [
-                    index
-                    for index, point_name in enumerate(
-                        self._phc_contact_region_point_body_names
-                    )
-                    if point_name == region_name
-                ],
-                dtype=torch.long,
-                device=self.device,
+        if len(self._target_case_configs) > 1:
+            points, point_ids, point_indices = [], [], []
+            for config in self._target_case_configs:
+                case_points, case_names = self._load_contact_region_points(config)
+                points.append(case_points)
+                point_ids.append(self._resolve_contact_region_point_body_local_ids(case_names))
+                point_indices.append(tuple(
+                    torch.tensor([i for i, name in enumerate(case_names) if name == region], dtype=torch.long, device=self.device)
+                    for region in self._phc_contact_region_names
+                ))
+            self._phc_contact_region_points_local = torch.tensor(
+                np.stack(points), dtype=torch.float32, device=self.device,
             )
-            for region_name in self._phc_contact_region_names
-        )
+            self._phc_contact_region_point_body_local_ids = torch.stack(point_ids)
+            max_points = max(len(indices) for case in point_indices for indices in case)
+            padded = torch.zeros((len(point_indices), len(self._phc_contact_region_names), max_points), dtype=torch.long, device=self.device)
+            valid = torch.zeros_like(padded, dtype=torch.bool)
+            for case_index, case in enumerate(point_indices):
+                for region_index, indices in enumerate(case):
+                    padded[case_index, region_index, :len(indices)] = indices
+                    valid[case_index, region_index, :len(indices)] = True
+            self._phc_contact_region_point_indices = padded
+            self._phc_contact_region_point_valid = valid
+        else:
+            self._phc_contact_region_point_body_local_ids = self._resolve_contact_region_point_body_local_ids()
+            self._phc_contact_region_point_indices = tuple(
+                torch.tensor([index for index, name in enumerate(self._phc_contact_region_point_body_names) if name == region], dtype=torch.long, device=self.device)
+                for region in self._phc_contact_region_names
+            )
         hand_ids = sorted(set(self._left_hand_body_ids + self._right_hand_body_ids))
         self._phc_contact_hand_body_ids = torch.tensor(hand_ids, dtype=torch.long, device=self.device)
         self._phc_contact_label_body_ids = self._resolve_contact_label_body_ids()
@@ -591,8 +650,8 @@ class HumanoidImPassiveObject(HumanoidIm):
             selected.append(matches[0])
         return torch.tensor(selected, dtype=torch.long, device=self.device)
 
-    def _resolve_contact_region_point_body_local_ids(self):
-        point_names = list(self._phc_contact_region_point_body_names)
+    def _resolve_contact_region_point_body_local_ids(self, point_names=None):
+        point_names = list(self._phc_contact_region_point_body_names if point_names is None else point_names)
         if not point_names:
             return torch.zeros((0,), dtype=torch.long, device=self.device)
         body_names = [str(name) for name in self._target_body_names]
@@ -700,7 +759,7 @@ class HumanoidImPassiveObject(HumanoidIm):
         )
         return torch.round(motion_times * float(self._target_qpos_fps)).long()
 
-    def _target_qpos_ref_for_frames(self, frame_indices):
+    def _target_qpos_ref_for_frames(self, frame_indices, env_ids=None):
         frames = torch.clamp(frame_indices.long(), 0, self._target_joint_qpos.shape[0] - 1)
         return self._target_joint_qpos[frames]
 
@@ -723,7 +782,7 @@ class HumanoidImPassiveObject(HumanoidIm):
             HumanoidAMP.StateInit.Start,
         }:
             frames = torch.zeros_like(frames)
-        reset_qpos = self._target_qpos_ref_for_frames(frames)
+        reset_qpos = self._target_qpos_ref_for_frames(frames, env_ids)
         self._target_dof_pos[env_ids, :] = reset_qpos
         self._target_dof_vel[env_ids, :] = 0.0
         if self._target_last_reset_joint_qpos is None:
@@ -739,11 +798,17 @@ class HumanoidImPassiveObject(HumanoidIm):
         tensor = tensor.reshape(self.num_envs, -1)
         pad = torch.zeros((self.num_envs, target_k), dtype=tensor.dtype, device=tensor.device)
         if position_targets and "robocasa_physics" in self._phc_object_config:
-            pad[:] = torch.as_tensor(
-                [joint["springref"] for joint in self._phc_object_config["robocasa_physics"]["joints"]],
-                dtype=tensor.dtype, device=tensor.device,
-            )
+            pad[:] = self._target_spring_targets(tensor)
         return torch.cat([tensor, pad], dim=1).contiguous()
+
+    def _target_spring_targets(self, tensor):
+        targets = torch.as_tensor(
+            [[joint["springref"] for joint in config["robocasa_physics"]["joints"]]
+             for config in self._target_case_configs],
+            dtype=tensor.dtype, device=tensor.device,
+        )
+        case_ids = torch.arange(self.num_envs, device=tensor.device) % len(targets)
+        return targets[case_ids]
 
     def _reset_env_tensors(self, env_ids):
         humanoid_ids = self._humanoid_actor_ids[env_ids]
@@ -766,10 +831,7 @@ class HumanoidImPassiveObject(HumanoidIm):
             self.num_envs, self._dof_state.shape[0] // self.num_envs, 2,
         )[..., 0].clone()
         if "robocasa_physics" in self._phc_object_config:
-            position_targets[:, self.num_dof : self.num_dof + self._target_max_dof] = torch.as_tensor(
-                [joint["springref"] for joint in self._phc_object_config["robocasa_physics"]["joints"]],
-                dtype=position_targets.dtype, device=position_targets.device,
-            )
+            position_targets[:, self.num_dof : self.num_dof + self._target_max_dof] = self._target_spring_targets(position_targets)
         self.gym.set_dof_position_target_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(position_targets.contiguous()),
@@ -890,20 +952,35 @@ class HumanoidImPassiveObject(HumanoidIm):
         target_body_ids = (
             int(self.num_bodies) + self._phc_contact_region_point_body_local_ids
         )
-        body_state = self._rigid_body_state_reshaped[:, target_body_ids, :]
+        if target_body_ids.ndim == 2:
+            case_ids = torch.arange(self.num_envs, device=self.device) % len(self._target_case_configs)
+            indices = target_body_ids[case_ids, :, None].expand(-1, -1, self._rigid_body_state_reshaped.shape[-1])
+            body_state = self._rigid_body_state_reshaped.gather(1, indices)
+        else:
+            body_state = self._rigid_body_state_reshaped[:, target_body_ids, :]
         body_pos = body_state[..., 0:3]
         body_quat = F.normalize(body_state[..., 3:7], dim=-1)
-        local = self._phc_contact_region_points_local.unsqueeze(0).expand(
-            self.num_envs, -1, -1
-        )
+        if self._phc_contact_region_points_local.ndim == 3:
+            case_ids = torch.arange(self.num_envs, device=self.device) % len(self._target_case_configs)
+            local = self._phc_contact_region_points_local[case_ids]
+        else:
+            local = self._phc_contact_region_points_local.unsqueeze(0).expand(
+                self.num_envs, -1, -1
+            )
         return body_pos + quat_rotate(body_quat, local)
 
     def _target_contact_region_force_norm(self):
         local_ids = self._phc_contact_region_body_local_ids
-        return torch.linalg.norm(
+        result = torch.linalg.norm(
             self._target_contact_forces[:, local_ids, :],
             dim=-1,
         )
+        if len(self._target_case_configs) > 1:
+            present = torch.tensor([[name in config["contact_region_body_names"] for name in self._phc_contact_region_names]
+                                    for config in self._target_case_configs], dtype=torch.bool, device=self.device)
+            case_ids = torch.arange(self.num_envs, device=self.device) % len(self._target_case_configs)
+            result = result.masked_fill(~present[case_ids], 0.0)
+        return result
 
     def _contact_ref_for_frames(self, frame_indices):
         n = int(frame_indices.shape[0])
@@ -923,6 +1000,16 @@ class HumanoidImPassiveObject(HumanoidIm):
         region_pos = self._target_contact_region_positions()
         label_body_ids = self._phc_contact_label_body_ids
         body_state = self._rigid_body_state_reshaped[:, label_body_ids, :]
+        if len(self._target_case_configs) > 1:
+            return torch.stack([
+                capsule_region_surface_distances(
+                    body_pos=body_state[..., 0:3], body_quat_xyzw=body_state[..., 3:7],
+                    endpoints_local=self._phc_contact_label_capsule_endpoints_local,
+                    radii=self._phc_contact_label_capsule_radii,
+                    valid=self._phc_contact_label_capsule_valid,
+                    region_points=points, point_valid=valid,
+                ) for points, valid in self._target_region_batches(region_pos)
+            ], dim=-1)
         return torch.stack(
             [
                 capsule_region_surface_distances(
@@ -951,14 +1038,16 @@ class HumanoidImPassiveObject(HumanoidIm):
         region_pos = self._target_contact_region_positions()
         body_state = self._rigid_body_state_reshaped[:, self._phc_hand_body_ids_flat, :]
         distance_by_region = []
-        for point_indices in self._phc_contact_region_point_indices:
+        batches = (self._target_region_batches(region_pos) if len(self._target_case_configs) > 1 else
+                   ((region_pos[:, indices], None) for indices in self._phc_contact_region_point_indices))
+        for points, point_valid in batches:
             capsule_distance = capsule_region_surface_distances(
                 body_pos=body_state[..., 0:3],
                 body_quat_xyzw=body_state[..., 3:7],
                 endpoints_local=self._phc_hand_capsule_endpoints_local,
                 radii=self._phc_hand_capsule_radii,
                 valid=self._phc_hand_capsule_valid,
-                region_points=region_pos[:, point_indices],
+                region_points=points, point_valid=point_valid,
             )
             box_distance = box_region_surface_distances(
                 body_pos=body_state[..., 0:3],
@@ -967,7 +1056,7 @@ class HumanoidImPassiveObject(HumanoidIm):
                 quaternions_local_xyzw=self._phc_hand_box_quaternions_local,
                 half_extents=self._phc_hand_box_half_extents,
                 valid=self._phc_hand_box_valid,
-                region_points=region_pos[:, point_indices],
+                region_points=points, point_valid=point_valid,
             )
             body_distance = torch.minimum(capsule_distance, box_distance)
             distance_by_region.append(
@@ -980,6 +1069,13 @@ class HumanoidImPassiveObject(HumanoidIm):
                 )
             )
         return torch.stack(distance_by_region, dim=-1)
+
+    def _target_region_batches(self, region_pos):
+        case_ids = torch.arange(self.num_envs, device=self.device) % len(self._target_case_configs)
+        indices = self._phc_contact_region_point_indices[case_ids]
+        valid = self._phc_contact_region_point_valid[case_ids]
+        for region in range(len(self._phc_contact_region_names)):
+            yield region_pos.gather(1, indices[:, region, :, None].expand(-1, -1, 3)), valid[:, region]
 
     def _physics_step(self):
         if self.control_mode != "pd":

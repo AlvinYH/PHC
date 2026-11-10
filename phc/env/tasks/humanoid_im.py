@@ -38,6 +38,8 @@ class HumanoidIm(humanoid_amp_task.HumanoidAMPTask):
         self._fut_tracks = cfg["env"].get("fut_tracks", False)
         self._fut_tracks_dropout = cfg["env"].get("fut_tracks_dropout", False)
         self.seq_motions = cfg["env"].get("seq_motions", False)
+        if hasattr(self, "_ours_num_traj") and self._ours_num_traj > 1:
+            self.seq_motions = True
         if self._fut_tracks:
             self._num_traj_samples = cfg["env"]["numTrajSamples"]
         else:

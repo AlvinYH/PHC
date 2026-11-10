@@ -227,45 +227,30 @@ class MotionLibBase():
 
 
         motion_data_list = self._motion_data_list[sample_idxes.cpu().numpy()]
-        reuse_single_motion = (
-            self._num_unique_motions == 1
-            and max_len == -1
+        reuse_motion = (
+            max_len == -1
             and not self.m_cfg.randomrize_heading
-            and torch.equal(
-                sample_idxes,
-                sample_idxes[:1].expand_as(sample_idxes),
-            )
-            and all(tree is skeleton_trees[0] for tree in skeleton_trees)
             and isinstance(gender_betas, torch.Tensor)
             and isinstance(limb_weights, torch.Tensor)
-            and torch.equal(
-                gender_betas,
-                gender_betas[:1].expand_as(gender_betas),
-            )
-            and torch.equal(
-                limb_weights,
-                limb_weights[:1].expand_as(limb_weights),
-            )
         )
         torch.set_num_threads(1)
         mp.set_sharing_strategy('file_descriptor')
 
-        if reuse_single_motion:
-            print(
-                "Reusing one parsed reference motion across "
-                f"{len(skeleton_trees)} identical environments."
-            )
-            parsed = self.load_motion_with_skeleton(
-                np.array([0]),
-                motion_data_list[:1],
-                skeleton_trees[:1],
-                gender_betas[:1],
-                self.mesh_parsers,
-                self.m_cfg,
-                None,
-                0,
-            )[0]
-            res_acc = {index: parsed for index in range(len(motion_data_list))}
+        if reuse_motion:
+            parsed_motions = {}
+            res_acc = {}
+            for index, sample in enumerate(sample_idxes.tolist()):
+                key = (sample, id(skeleton_trees[index]),
+                       gender_betas[index].numpy().tobytes(),
+                       limb_weights[index].numpy().tobytes())
+                if key not in parsed_motions:
+                    parsed_motions[key] = self.load_motion_with_skeleton(
+                        np.array([0]), motion_data_list[index:index + 1],
+                        skeleton_trees[index:index + 1], gender_betas[index:index + 1],
+                        self.mesh_parsers, self.m_cfg, None, 0,
+                    )[0]
+                res_acc[index] = parsed_motions[key]
+            print(f"Parsed {len(parsed_motions)} motions for {len(motion_data_list)} environments.")
         else:
             num_jobs = min(mp.cpu_count(), 64)
 

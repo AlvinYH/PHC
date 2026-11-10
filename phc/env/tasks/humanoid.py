@@ -852,6 +852,28 @@ class Humanoid(BaseTask):
                 )
                 self.humanoid_assets = [humanoid_asset] * num_envs
                 self.skeleton_trees = [sk_tree] * num_envs
+                if hasattr(self, "_ours_num_traj") and self._ours_num_traj > 1:
+                    case_root = self._ours_reference_path.parent / "phc" / "reference" / "cases"
+                    assets, skeletons = [], []
+                    dof_names = self.gym.get_asset_dof_names(humanoid_asset)
+                    dof_props = self.gym.get_asset_dof_properties(humanoid_asset)
+                    for case_id in range(self._ours_num_traj):
+                        xml_path = case_root / f"traj_{case_id:02d}" / "humanoid.xml"
+                        skeleton = SkeletonTree.from_mjcf(str(xml_path))
+                        asset = self.gym.load_asset(self.sim, str(xml_path.parent), xml_path.name, asset_options)
+                        props = self.gym.get_asset_dof_properties(asset)
+                        efforts = [prop.motor_effort for prop in self.gym.get_asset_actuator_properties(asset)]
+                        if (skeleton.node_names != sk_tree.node_names
+                                or self.gym.get_asset_dof_names(asset) != dof_names
+                                or efforts != motor_efforts
+                                or any(not np.array_equal(props[field], dof_props[field]) for field in ("lower", "upper", "effort"))):
+                            raise ValueError(f"Case humanoid layout differs: {xml_path}")
+                        if self.self_obs_v == 3:
+                            self.create_humanoid_force_sensors(asset, self.force_sensor_joints)
+                        assets.append(asset)
+                        skeletons.append(skeleton)
+                    self.humanoid_assets = [assets[i % len(assets)] for i in range(num_envs)]
+                    self.skeleton_trees = [skeletons[i % len(skeletons)] for i in range(num_envs)]
             elif self.has_shape_variation:
                 
                 queue = mp.Queue()
