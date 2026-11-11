@@ -136,6 +136,20 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             bool(self._ours_part_aware_contact_reward_enabled)
             or self._ours_active_joint_torque_enabled
         )
+        self._ours_part_force_contact_enabled = "part_force_contact" in self._ours_reward_weights
+        if self._ours_part_force_contact_enabled:
+            config = self._ours_reward_weights["part_force_contact"]
+            if not self._ours_part_aware_contact_reward_enabled:
+                raise ValueError("part_force_contact requires part_aware_contact_reward_enabled")
+            for name in ("weight", "wrong_part_weight", "extra_contact_weight",
+                         "distance_threshold", "finger_force_threshold", "part_force_threshold"):
+                if not np.isfinite(float(config[name])) or float(config[name]) < 0.0:
+                    raise ValueError(f"part_force_contact.{name} must be finite and nonnegative")
+        self._ours_motion_penalties_enabled = "motion_penalties" in self._ours_reward_weights
+        self._ours_progress_reset_relative = (
+            "progress_reset_relative_prerequisites" in self._ours_reward_weights
+            and self._ours_reward_weights.pop("progress_reset_relative_prerequisites")
+        )
         self._ours_reset = dict(env["oursReset"])
         # Older residual commands carry no mode flag, so absent means residual.
         action_mode = str(env.get("oursActionMode", "residual"))
@@ -1154,6 +1168,14 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                     raise ValueError(
                         "Studio part-aware finger surface has fewer points than part KNN count"
                     )
+        if self._ours_part_force_contact_enabled:
+            self._ours_all_contact_forces = gymtorch.wrap_tensor(
+                self.gym.acquire_net_contact_force_tensor(self.sim),
+            ).view(self.num_envs, -1, 3)
+            self._ours_force_part_ids = torch.unique(torch.cat((
+                self._ours_surface_link_ids.flatten(),
+                self._ours_finger_surface_link_ids.flatten(),
+            )), sorted=True)
         root_bbox = np.asarray(ref["policy_root_bbox"])
         child_bbox = np.asarray(ref["policy_active_child_bbox"])
         if self._ours_num_traj > 1:
@@ -1237,6 +1259,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_previous_active_link_linear_velocity,
         )
         self._ours_action_rate_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self._ours_motion_penalties_enabled:
+            self._ours_previous_final_action = torch.zeros_like(self._ours_previous_residual)
         self._ours_human_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._ours_object_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._ours_contact_reset = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -1722,19 +1746,36 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         phase_direction = self._ours_ref_frame(self._ours_phase_direction, frames)[:, 0]
         phase_target = self._ours_ref_frame(self._ours_phase_target, frames)[:, 0]
         phase_predecessor = self._ours_ref_frame(self._ours_phase_predecessor, frames)[:, 0]
-        # 新阶段入口只看上一阶段在切换时的实际完成度，不记录历史最大值。
-        # cap 只扩展当前阶段的 reward；前序门始终按 canonical [0,1] 完成率判断，
-        # 避免超过 GT 终点的 overshoot 被用来补足未完成的 reference 行程。
         previous_phase_index = self._ours_progress_phase_start.clamp_min(0)
+        previous_phase_target = self._ours_ref_frame(self._ours_phase_target, previous_phase_index)[:, 0]
+        previous_phase_direction = self._ours_ref_frame(self._ours_phase_direction, previous_phase_index)[:, 0]
+        previous_phase_reference_start = self._ours_active_values(
+            self._ours_ref_frame(self._target_joint_qpos, previous_phase_index),
+        )
+        if self._ours_progress_reset_relative:
+            previous_phase_reference_start = self._ours_progress_phase_entry_qpos
         previous_phase_completion = phase_relative_progress(
             self._ours_previous_active_qpos,
             self._ours_progress_phase_entry_qpos,
-            self._ours_active_values(self._ours_ref_frame(self._target_joint_qpos, previous_phase_index)),
-            self._ours_ref_frame(self._ours_phase_target, previous_phase_index)[:, 0],
-            self._ours_ref_frame(self._ours_phase_direction, previous_phase_index)[:, 0],
+            previous_phase_reference_start,
+            previous_phase_target,
+            previous_phase_direction,
             self._ours_progress_phase_start >= 0,
             target_cap_scale=1.0,
         )
+        if self._ours_progress_reset_relative:
+            remaining = previous_phase_direction * (
+                previous_phase_target - self._ours_progress_phase_entry_qpos
+            )
+            reached = previous_phase_direction * (
+                self._ours_previous_active_qpos - previous_phase_target
+            ) >= -1.0e-6
+            previous_phase_completion = torch.where(
+                (self._ours_progress_phase_start >= 0)
+                & (previous_phase_direction != 0.0) & (remaining <= 1.0e-6),
+                reached.to(dtype=previous_phase_completion.dtype),
+                previous_phase_completion,
+            )
         gate, phase_id, all_previous_passed, phase_changed = (
             phase_prerequisite_transition(
                 phase_start, phase_predecessor, phase_active,
@@ -1743,6 +1784,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 self._ours_progress_all_previous_passed,
                 mode=self._ours_progress_prerequisite_mode,
                 threshold=self._ours_progress_prerequisite_threshold,
+                allow_initial_phase=self._ours_progress_reset_relative,
             )
         )
         phase_entry_qpos = torch.where(
@@ -1798,6 +1840,47 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "finger_contact_force": finger_force,
             "contact_force": self._contact_forces,
         }
+        if self._ours_part_force_contact_enabled:
+            config = self._ours_reward_weights["part_force_contact"]
+            part_ids = self._ours_force_part_ids
+            finger_links = self._ours_finger_surface_link_ids
+            collision_links = self._ours_surface_link_ids
+            if self._ours_num_traj > 1:
+                finger_links = finger_links[self._ours_traj_id]
+                collision_links = collision_links[self._ours_traj_id]
+            else:
+                finger_links = finger_links.expand(self.num_envs, -1)
+                collision_links = collision_links.expand(self.num_envs, -1)
+            if self._ours_recon_contact_region:
+                # VLM marks fingers, while the region can include multiple links.
+                allowed = (finger_links[..., None] == part_ids).any(dim=1)[:, None, :]
+                target_ids = torch.full_like(reference_finger_contact, -1, dtype=torch.long)
+            else:
+                target_ids = self._ours_ref_frame(self._ours_finger_contact_part_ids, frames)
+                allowed = target_ids[..., None] == part_ids
+            region_distance = joint_region_and_part_surface_distances_chunked(
+                finger_state[..., :3], full_object_surface, finger_links, part_ids,
+                target_ids, part_knn_k=1, return_part_distances=True,
+            )[-1]
+            collision_distance = joint_region_and_part_surface_distances_chunked(
+                finger_state[..., :3], current_surface, collision_links, part_ids,
+                target_ids, part_knn_k=1, return_part_distances=True,
+            )[-1]
+            threshold = float(config["distance_threshold"])
+            region_near = region_distance < threshold
+            part_force = self._ours_all_contact_forces.index_select(
+                1, self._ours_all_object_ids.index_select(0, part_ids),
+            )
+            if not torch.isfinite(part_force).all():
+                raise FloatingPointError("non-finite object-part contact force")
+            contact["part_force_live"] = (
+                (finger_force.norm(dim=-1) > float(config["finger_force_threshold"]))[..., None]
+                & (part_force.norm(dim=-1) > float(config["part_force_threshold"]))[:, None, :]
+                & (region_near | (collision_distance < threshold))
+            )
+            contact["part_force_target_region"] = (
+                reference_finger_contact[..., None] & allowed & region_near
+            )
         articulation = {
             "active_qpos": active,
             "reference_active_qpos": active_reference,
@@ -1836,6 +1919,27 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "active_joint_phase_direction": phase_direction,
                 "active_joint_phase_active": phase_active,
             })
+        regularization = {
+            "feet_velocity_xy": self._rigid_body_vel[:, self._ours_feet_ids, :2],
+            "feet_in_contact": self._contact_forces[:, self._ours_feet_ids, 2] > 1.0,
+            "dof_pos": self._dof_pos,
+            "soft_dof_lower": self._ours_soft_dof_lower,
+            "soft_dof_upper": self._ours_soft_dof_upper,
+            "residual_action": residual,
+            "previous_residual_action": self._ours_previous_residual,
+            "action_rate_valid": self._ours_action_rate_valid,
+        }
+        if self._ours_motion_penalties_enabled:
+            regularization.update({
+                "final_action": self.actions,
+                "previous_final_action": self._ours_previous_final_action,
+                "control_dt": self.dt,
+                "dof_velocity": self._dof_vel,
+                "dof_acceleration": (self._dof_vel - self._ours_previous_dof_velocity) / self.dt,
+                "feet_contact_force": self._contact_forces[:, self._ours_feet_ids],
+                "root_rotation": self._rigid_body_rot[:, 0],
+                "root_angular_velocity": self._rigid_body_ang_vel[:, 0],
+            })
         reward, terms = compute_reward(
             human={
                 "body_pos": self._rigid_body_pos,
@@ -1869,16 +1973,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             },
             contact=contact,
             articulation=articulation,
-            regularization={
-                "feet_velocity_xy": self._rigid_body_vel[:, self._ours_feet_ids, :2],
-                "feet_in_contact": self._contact_forces[:, self._ours_feet_ids, 2] > 1.0,
-                "dof_pos": self._dof_pos,
-                "soft_dof_lower": self._ours_soft_dof_lower,
-                "soft_dof_upper": self._ours_soft_dof_upper,
-                "residual_action": residual,
-                "previous_residual_action": self._ours_previous_residual,
-                "action_rate_valid": self._ours_action_rate_valid,
-            },
+            regularization=regularization,
             indices=self._ours_reward_indices,
             weights=self._ours_reward_weights,
         )
@@ -1908,6 +2003,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ):
             self._ours_last_reward_terms = {name: value.detach().clone() for name, value in terms.items()}
         self._ours_previous_residual = residual.detach().clone()
+        if self._ours_motion_penalties_enabled:
+            self._ours_previous_final_action = self.actions.detach().clone()
         # Isaac Gym refreshes the live state tensors in place.  ``detach()``
         # alone would keep an alias to the current frame, making every
         # acceleration difference zero on the following step.
@@ -2165,6 +2262,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_previous_active_qpos[env_ids] = self._ours_episode_start_qpos[env_ids]
         self._ours_action_rate_valid[env_ids] = False
         self._ours_previous_residual[env_ids] = 0.0
+        if self._ours_motion_penalties_enabled:
+            self._ours_previous_final_action[env_ids] = 0.0
         self._ours_previous_dof_velocity[env_ids] = 0.0
         self._ours_previous_object_linear_velocity[env_ids] = 0.0
         self._ours_previous_object_angular_velocity[env_ids] = 0.0
