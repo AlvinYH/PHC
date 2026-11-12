@@ -108,6 +108,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_hybrid_start_mask = None
         self._ours_reference_path = Path(env["oursReferencePath"]).expanduser()
         self._ours_reward_weights = dict(env["oursReward"])
+        self._ours_progress_phase_detection = (
+            self._ours_reward_weights.pop("progress_phase_detection")
+            if "progress_phase_detection" in self._ours_reward_weights else None
+        )
         self._ours_coarse_surface_path = (
             Path(self._ours_reward_weights.pop("coarse_uniform_surface_path"))
             if "coarse_uniform_surface_path" in self._ours_reward_weights else None
@@ -647,6 +651,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "finger_contact_body_names", "finger_contact_labels",
             "contact_labels",
         }
+        if self._ours_progress_phase_detection is not None:
+            needed.add("joint_types")
         if self._ours_active_joint_torque_enabled:
             needed.update((
                 "active_joint_origin_parent_local_scaled",
@@ -1243,13 +1249,32 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             case_ids = torch.arange(self._ours_num_traj, device=self.device)
             qref = self._target_joint_qpos[case_ids, :, self._ours_active_dof_by_case].unsqueeze(-1)
         else:
-            qref = self._target_joint_qpos[..., self._ours_active_dof:self._ours_active_dof + 1]
+            qref = self._target_joint_qpos[:, self._ours_active_dof:self._ours_active_dof + 1].unsqueeze(0)
+        qref = qref.detach().cpu().numpy()
+        phase_config = self._ours_progress_phase_detection
+        if phase_config is None:
+            phases = [build_phase_progress_tables(q) for q in qref]
+        else:
+            joint_types = self._ours_reference_np["joint_types"].reshape(-1)
+            if joint_types.size != len(self._target_joint_names):
+                raise ValueError("Studio joint types must match the reference joint names")
+            lengths = (
+                self._ours_reference_np["traj_lengths"]
+                if self._ours_num_traj > 1 else [qref.shape[1]]
+            )
+            phases = [
+                build_phase_progress_tables(
+                    q, phase_config=phase_config, fps=float(self._target_qpos_fps),
+                    joint_type=str(joint_types[self._target_joint_names.index(name)]),
+                    valid_frames=int(length),
+                )
+                for q, name, length in zip(qref, self._ours_active_joint_names, lengths)
+            ]
         if self._ours_num_traj > 1:
-            phases = [build_phase_progress_tables(q.detach().cpu().numpy()) for q in qref]
             phase = tuple(np.stack([item[index] for item in phases]) for index in range(4))
             predecessor = np.stack([build_phase_predecessor_table(item[0], item[3]) for item in phases])
         else:
-            phase = build_phase_progress_tables(qref.detach().cpu().numpy())
+            phase = phases[0]
             predecessor = build_phase_predecessor_table(phase[0], phase[3])
         self._ours_phase_start = torch.tensor(phase[0], dtype=torch.long, device=self.device)
         self._ours_phase_target = torch.tensor(phase[1], dtype=torch.float32, device=self.device)
@@ -2075,6 +2100,13 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ).sum()
         self._ours_opening_q_count += opening.sum(dtype=torch.int64)
         values = {"total": reward, **terms}
+        if flags.im_eval:
+            self._ours_progress_evaluation = torch.stack((
+                phase_start, phase_predecessor, phase_changed, phase_direction, phase_target,
+                phase_entry_qpos, previous_phase_completion, phase_completion, progress_gate,
+                progress_bonus, progress_overshoot, terms["progress_contact_multiplier"],
+                terms["r_progress_bonus"], terms["r_progress_overshoot"], terms["r_progress"],
+            ), dim=-1).detach()
         ranged_names = {
             "active_hinge_q",
             "reference_hinge_q",
@@ -2565,6 +2597,13 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "finger_handle_contact": contact.to(dtype=force.dtype).detach().cpu().numpy(),
             "hinge_phase_active": self._ours_ref_frame(self._ours_phase_active, frames).detach().cpu().numpy(),
         }
+        rollout["ours_evaluation"].update(zip((
+            "progress_phase_start", "progress_phase_predecessor", "progress_phase_changed",
+            "progress_phase_direction", "progress_phase_target", "progress_phase_entry_q",
+            "progress_predecessor_completion", "progress_phase_completion", "progress_gate_open",
+            "progress_reference_paced_bonus", "progress_raw_overshoot", "progress_contact_multiplier",
+            "r_progress_bonus", "r_progress_overshoot", "r_progress",
+        ), self._ours_progress_evaluation.cpu().numpy().T))
     def finalize_ours_outputs(self):
         """Flush bounded diagnostics once at the agent/player lifecycle boundary."""
 
