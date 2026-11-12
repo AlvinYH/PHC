@@ -108,6 +108,17 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_hybrid_start_mask = None
         self._ours_reference_path = Path(env["oursReferencePath"]).expanduser()
         self._ours_reward_weights = dict(env["oursReward"])
+        self._ours_coarse_surface_path = (
+            Path(self._ours_reward_weights.pop("coarse_uniform_surface_path"))
+            if "coarse_uniform_surface_path" in self._ours_reward_weights else None
+        )
+        if self._ours_coarse_surface_path is not None and (
+            not self._ours_reward_weights["coarse_contact_reward_enabled"]
+            or not self._ours_reward_weights["contact_distance_reward_enabled"]
+            or self._ours_reward_weights["fine_contact_reward_enabled"]
+            or self._ours_reward_weights["contact_binary_reward_enabled"]
+        ):
+            raise ValueError("The uniform surface requires coarse distance-only contact")
         self._ours_progress_mode = str(
             self._ours_reward_weights.pop("progress_mode", "phase_relative_completion")
         )
@@ -1176,6 +1187,24 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 self._ours_surface_link_ids.flatten(),
                 self._ours_finger_surface_link_ids.flatten(),
             )), sorted=True)
+        if self._ours_coarse_surface_path is not None:
+            with np.load(self._ours_coarse_surface_path, allow_pickle=False) as surface:
+                points = surface["points"]
+                links = surface["links"]
+            if (
+                points.ndim != 3 or points.shape[0] != self._ours_num_traj
+                or points.shape[-1] != 3 or points.shape[1] == 0
+                or links.shape != points.shape[:2] or not np.isfinite(points).all()
+            ):
+                raise ValueError("Uniform coarse surface must have finite [trajectories, points, 3] data")
+            if set(links.reshape(-1)).difference(object_names):
+                raise ValueError("Uniform coarse surface contains an unknown object link")
+            link_ids = [[object_names.index(name) for name in row] for row in links]
+            if self._ours_num_traj == 1:
+                points = points[0]
+                link_ids = link_ids[0]
+            self._ours_coarse_surface_points = torch.as_tensor(points, dtype=torch.float32, device=self.device)
+            self._ours_coarse_surface_links = torch.as_tensor(link_ids, dtype=torch.long, device=self.device)
         root_bbox = np.asarray(ref["policy_root_bbox"])
         child_bbox = np.asarray(ref["policy_active_child_bbox"])
         if self._ours_num_traj > 1:
@@ -1610,16 +1639,16 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         ).reshape(expanded.shape)
         return world + link_state[..., :3]
 
-    def _ours_world_finger_contact_surface(self, object_link_state):
+    def _ours_world_contact_surface(self, object_link_state, surface_points, surface_links):
         if self._ours_num_traj > 1:
-            indices = self._ours_finger_surface_link_ids[self._ours_traj_id, :, None].expand(-1, -1, object_link_state.shape[-1])
+            indices = surface_links[self._ours_traj_id, :, None].expand(-1, -1, object_link_state.shape[-1])
             link_state = object_link_state.gather(1, indices)
         else:
-            link_state = object_link_state.index_select(1, self._ours_finger_surface_link_ids)
-        if self._ours_finger_surface_points_local.ndim == 3:
-            points = self._ours_finger_surface_points_local[self._ours_traj_id]
+            link_state = object_link_state.index_select(1, surface_links)
+        if surface_points.ndim == 3:
+            points = surface_points[self._ours_traj_id]
         else:
-            points = self._ours_finger_surface_points_local.unsqueeze(0).expand(
+            points = surface_points.unsqueeze(0).expand(
                 object_link_state.shape[0], -1, -1,
             )
         world = quat_apply(
@@ -1660,7 +1689,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         actual_contact = body_contact_indicator(self._contact_forces)
         current_links = self._rigid_body_state_reshaped[:, self._ours_all_object_ids]
         current_surface = self._ours_world_surface_points(current_links)
-        full_object_surface = self._ours_world_finger_contact_surface(current_links)
+        full_object_surface = self._ours_world_contact_surface(
+            current_links, self._ours_finger_surface_points_local, self._ours_finger_surface_link_ids,
+        )
         finger_state = self._rigid_body_state_reshaped[:, self._ours_finger_ids]
         reference_finger_contact = self._ours_ref_frame(self._ours_finger_contact_reference, frames)
         reference_hand_contact = self._ours_ref_frame(self._phc_contact_labels_hand2, frames).bool()
@@ -1830,10 +1861,18 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         reference_active_link_state = self._ours_ref_frame_links(
             frames, self._ours_child_index_by_case[self._ours_traj_id] if self._ours_num_traj > 1 else self._ours_child_object_index,
         )
+        coarse_reward_distance = hand_object_distance
+        if self._ours_coarse_surface_path is not None:
+            uniform_points = self._ours_world_contact_surface(
+                current_links, self._ours_coarse_surface_points, self._ours_coarse_surface_links,
+            )
+            coarse_reward_distance = whole_hand_object_distance(
+                joint_region_surface_distances_chunked(finger_state[..., :3], uniform_points),
+            )
         contact = {
             "reference_hand_contact": reference_hand_contact,
             "reference_finger_contact": reference_finger_contact,
-            "hand_object_distance": hand_object_distance,
+            "hand_object_distance": coarse_reward_distance,
             "finger_whole_object_distance": whole_finger_object_distance,
             "finger_object_distance": finger_object_distance,
             "finger_binary_contact_distance": finger_binary_contact_distance,
