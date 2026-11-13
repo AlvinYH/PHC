@@ -1084,7 +1084,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             str(name)
             for name in self._phc_object_config["contact_region_point_link_names"]
         ]
-        if self._ours_recon_contact_region:
+        if self._ours_recon_contact_region or (
+            "finger_contact_label_source" in ref
+            and str(np.asarray(ref["finger_contact_label_source"]).reshape(-1)[0]) == "arctic_gt_full_object"
+        ):
             expected_points = np.asarray(ref["finger_contact_surface_points_link_local_scaled"], dtype=np.float32)
             expected_names = point_names("finger_contact_surface_point_link_names")
         else:
