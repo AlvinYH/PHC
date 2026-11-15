@@ -201,8 +201,18 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_tracker_activation = env["studioTrackerActivation"]
         self._ours_trace_path = Path(env["oursTracePath"]).expanduser() if env.get("oursTracePath") else None
         self._ours_eval_path = Path(env["oursEvalPath"]).expanduser()
-        self._ours_closed_loop_trace_path = Path(env["oursClosedLoopTracePath"]).expanduser() if env.get("oursClosedLoopTracePath") else None
-        self._ours_closed_loop_trace_steps = int(env.get("oursClosedLoopTraceSteps", 0))
+        student_trace = env.get("oursStudentTracePath")
+        if student_trace and env.get("oursClosedLoopTracePath"):
+            raise ValueError("student trace and diagnostic trace are mutually exclusive")
+        if student_trace and not flags.im_eval:
+            raise ValueError("student traces require the single-environment evaluation player")
+        self._ours_closed_loop_trace_path = (
+            Path(student_trace).expanduser() if student_trace else
+            Path(env["oursClosedLoopTracePath"]).expanduser() if env.get("oursClosedLoopTracePath") else None
+        )
+        self._ours_closed_loop_trace_steps = int(
+            env.get("oursStudentTraceSteps", 0) if student_trace else env.get("oursClosedLoopTraceSteps", 0)
+        )
         self._ours_batch_replay = bool(env.get("oursBatchReplay", False))
         self._ours_action_replay_path = Path(env["oursActionReplayPath"]).expanduser() if env.get("oursActionReplayPath") else None
         self._ours_final_action_replay_path = Path(env["oursFinalActionReplayPath"]).expanduser() if env.get("oursFinalActionReplayPath") else None
@@ -219,8 +229,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
         if self._ours_batch_step_trace_path is not None and not self._ours_diagnostic_zero_residual:
             raise ValueError("batch-step trace is restricted to the zero-residual audit")
-        if self._ours_closed_loop_trace_path is not None and not 0 < self._ours_closed_loop_trace_steps <= 64:
-            raise ValueError("ours closed-loop trace length must be in [1,64]")
+        max_trace_steps = 4096 if student_trace else 64
+        if self._ours_closed_loop_trace_path is not None and not 0 < self._ours_closed_loop_trace_steps <= max_trace_steps:
+            raise ValueError(f"ours closed-loop trace length must be in [1,{max_trace_steps}]")
         if self._ours_batch_replay and self._ours_batch_step_trace_path is None:
             raise ValueError("bounded batch replay requires a batch-step trace")
         if self._ours_action_replay_path is not None and self._ours_closed_loop_trace_path is None and not self._ours_batch_replay:
@@ -1122,7 +1133,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             str(name)
             for name in self._phc_object_config["contact_region_point_link_names"]
         ]
-        if self._ours_recon_contact_region:
+        if self._ours_recon_contact_region or (
+            "finger_contact_label_source" in ref
+            and str(np.asarray(ref["finger_contact_label_source"]).reshape(-1)[0]) == "arctic_gt_full_object"
+        ):
             expected_points = np.asarray(ref["finger_contact_surface_points_link_local_scaled"], dtype=np.float32)
             expected_names = point_names("finger_contact_surface_point_link_names")
         else:
@@ -1798,12 +1812,29 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             part_aware=part_aware,
         )
         # Reset 继续使用旧的 whole-object live contact；part-aware 只改变 reward。
-        live_finger_contact = finger_object_contact_indicator(
-            whole_finger_object_distance,
-            finger_force,
-            distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
-            force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
-        )
+        try:
+            live_finger_contact = finger_object_contact_indicator(
+                whole_finger_object_distance,
+                finger_force,
+                distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
+                force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
+            )
+        except FloatingPointError as error:
+            bad_envs = (~torch.isfinite(whole_finger_object_distance)).any(dim=1).nonzero().flatten()
+            bad_fingers = finger_state[bad_envs, :, :3]
+            bad_surface = full_object_surface[bad_envs]
+            bad_links = current_links[bad_envs]
+            trajectory_ids = (
+                self._ours_traj_id[bad_envs[:20]].tolist()
+                if self._ours_num_traj > 1 else [0] * min(len(bad_envs), 20)
+            )
+            raise FloatingPointError(
+                f"{error}; env_ids={bad_envs[:20].tolist()}, "
+                f"trajectory_ids={trajectory_ids}, "
+                f"finger_position_nonfinite={(~torch.isfinite(bad_fingers)).sum().item()}, "
+                f"surface_nonfinite={(~torch.isfinite(bad_surface)).sum().item()}, "
+                f"object_link_state_nonfinite={(~torch.isfinite(bad_links)).sum().item()}"
+            ) from error
         # 旧 telemetry 保持 whole-object 语义，统一评测口径不随 reward 开关变化。
         self._ours_finger_object_distance = whole_finger_object_distance
         self._ours_reward_finger_object_distance = finger_object_distance

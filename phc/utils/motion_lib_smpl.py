@@ -52,17 +52,17 @@ class MotionLibSMPL(MotionLibBase):
         if osp.exists(data_dir):
             if motion_lib_cfg.smpl_type == "smpl":
                 smpl_parser_n = SMPL_Parser(model_path=data_dir, gender="neutral")
-                smpl_parser_m = SMPL_Parser(model_path=data_dir, gender="male")
-                smpl_parser_f = SMPL_Parser(model_path=data_dir, gender="female")
+                # smpl_parser_m = SMPL_Parser(model_path=data_dir, gender="male")
+                # smpl_parser_f = SMPL_Parser(model_path=data_dir, gender="female")
             elif motion_lib_cfg.smpl_type == "smplh":
                 smpl_parser_n = SMPLH_Parser(model_path=data_dir, gender="neutral")
-                smpl_parser_m = SMPLH_Parser(model_path=data_dir, gender="male")
-                smpl_parser_f = SMPLH_Parser(model_path=data_dir, gender="female")
+                # smpl_parser_m = SMPLH_Parser(model_path=data_dir, gender="male")
+                # smpl_parser_f = SMPLH_Parser(model_path=data_dir, gender="female")
             elif motion_lib_cfg.smpl_type == "smplx":
                 smpl_parser_n = SMPLX_Parser(model_path=data_dir, gender="neutral", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20)
-                smpl_parser_m = SMPLX_Parser(model_path=data_dir, gender="male", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20)
-                smpl_parser_f = SMPLX_Parser(model_path=data_dir, gender="female", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20)
-            self.mesh_parsers = {0: smpl_parser_n, 1: smpl_parser_m, 2: smpl_parser_f}
+                # smpl_parser_m = SMPLX_Parser(model_path=data_dir, gender="male", use_pca=False, create_transl=False, flat_hand_mean=True, num_betas=20)
+                # smpl_parser_f = SMPLX_Parser(model_path=data_dir, gender="female", use_pca=False, create_transl=False, flat_hand_mean=True, num_betas=20)
+            self.mesh_parsers = {0: smpl_parser_n}
         else:
             print("SMPL models not found, set mesh_parsers to None")
             self.mesh_parsers = None
