@@ -138,6 +138,11 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_progress_lead_tolerance = float(
             self._ours_reward_weights.pop("progress_lead_tolerance", 0.0)
         )
+        # 逐帧接触区域：区域点取自参考在各帧真正碰到的位置并记录来源帧，
+        # 当前帧只认 ±window 帧内的点（None = 旧行为，整条轨迹共用 CAD 级区域）
+        self._ours_region_frame_window = self._ours_reward_weights.pop(
+            "contact_region_frame_window", None
+        )
         self._ours_part_knn_k = self._ours_reward_weights.pop(
             "part_aware_part_knn_k", 2,
         )
@@ -653,6 +658,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         }
         if self._ours_progress_phase_detection is not None:
             needed.add("joint_types")
+        if self._ours_region_frame_window is not None:
+            needed.add("finger_contact_surface_point_frames")
         if self._ours_active_joint_torque_enabled:
             needed.update((
                 "active_joint_origin_parent_local_scaled",
@@ -1172,6 +1179,12 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             ref["finger_contact_surface_points_link_local_scaled"],
             dtype=torch.float32,
             device=self.device,
+        )
+        # 每个区域点的来源帧 [P] 或 [num_traj, P]，与区域点一一对应
+        self._ours_finger_surface_point_frames = (
+            None if self._ours_region_frame_window is None else torch.tensor(
+                ref["finger_contact_surface_point_frames"], dtype=torch.long, device=self.device,
+            )
         )
         finger_ids = [[object_names.index(name) for name in names] for names in finger_surface_names]
         self._ours_finger_surface_link_ids = torch.tensor(finger_ids if self._ours_num_traj > 1 else finger_ids[0], dtype=torch.long, device=self.device)
@@ -1717,6 +1730,14 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         full_object_surface = self._ours_world_contact_surface(
             current_links, self._ours_finger_surface_points_local, self._ours_finger_surface_link_ids,
         )
+        if self._ours_finger_surface_point_frames is not None:
+            # 不在当前帧 ±window 内的区域点移到 1km 外：最近点距离、接触判定（含 contact reset）
+            # 和 work 的接触点都只会落在参考此刻真正碰的位置上
+            point_frames = self._ours_finger_surface_point_frames
+            if point_frames.ndim == 2:
+                point_frames = point_frames[self._ours_traj_id]
+            far = (point_frames - frames[:, None]).abs() > int(self._ours_region_frame_window)
+            full_object_surface = full_object_surface.masked_fill(far[..., None], 1.0e3)
         finger_state = self._rigid_body_state_reshaped[:, self._ours_finger_ids]
         reference_finger_contact = self._ours_ref_frame(self._ours_finger_contact_reference, frames)
         reference_hand_contact = self._ours_ref_frame(self._phc_contact_labels_hand2, frames).bool()
