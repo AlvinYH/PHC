@@ -1711,12 +1711,29 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             part_aware=part_aware,
         )
         # Reset 继续使用旧的 whole-object live contact；part-aware 只改变 reward。
-        live_finger_contact = finger_object_contact_indicator(
-            whole_finger_object_distance,
-            finger_force,
-            distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
-            force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
-        )
+        try:
+            live_finger_contact = finger_object_contact_indicator(
+                whole_finger_object_distance,
+                finger_force,
+                distance_threshold=float(self._ours_reward_weights["finger_contact_distance"]),
+                force_threshold=float(self._ours_reward_weights["finger_contact_force"]),
+            )
+        except FloatingPointError as error:
+            bad_envs = (~torch.isfinite(whole_finger_object_distance)).any(dim=1).nonzero().flatten()
+            bad_fingers = finger_state[bad_envs, :, :3]
+            bad_surface = full_object_surface[bad_envs]
+            bad_links = current_links[bad_envs]
+            trajectory_ids = (
+                self._ours_traj_id[bad_envs[:20]].tolist()
+                if self._ours_num_traj > 1 else [0] * min(len(bad_envs), 20)
+            )
+            raise FloatingPointError(
+                f"{error}; env_ids={bad_envs[:20].tolist()}, "
+                f"trajectory_ids={trajectory_ids}, "
+                f"finger_position_nonfinite={(~torch.isfinite(bad_fingers)).sum().item()}, "
+                f"surface_nonfinite={(~torch.isfinite(bad_surface)).sum().item()}, "
+                f"object_link_state_nonfinite={(~torch.isfinite(bad_links)).sum().item()}"
+            ) from error
         # 旧 telemetry 保持 whole-object 语义，统一评测口径不随 reward 开关变化。
         self._ours_finger_object_distance = whole_finger_object_distance
         self._ours_reward_finger_object_distance = finger_object_distance
