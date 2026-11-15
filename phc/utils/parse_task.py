@@ -47,6 +47,8 @@ def warn_task_name():
 
 
 def parse_task(args, cfg, cfg_train, sim_params):
+    if args.task == "HumanoidGoalStudent":
+        from pipeline.physics.ours.student.environment import HumanoidGoalStudent
     # Demo task 才需要 websocket/图形依赖，普通 headless task 不提前导入。
     if args.task == "HumanoidImDemo":
         from phc.env.tasks.humanoid_im_demo import HumanoidImDemo

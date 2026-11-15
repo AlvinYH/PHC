@@ -167,8 +167,18 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_tracker_activation = env["studioTrackerActivation"]
         self._ours_trace_path = Path(env["oursTracePath"]).expanduser() if env.get("oursTracePath") else None
         self._ours_eval_path = Path(env["oursEvalPath"]).expanduser()
-        self._ours_closed_loop_trace_path = Path(env["oursClosedLoopTracePath"]).expanduser() if env.get("oursClosedLoopTracePath") else None
-        self._ours_closed_loop_trace_steps = int(env.get("oursClosedLoopTraceSteps", 0))
+        student_trace = env.get("oursStudentTracePath")
+        if student_trace and env.get("oursClosedLoopTracePath"):
+            raise ValueError("student trace and diagnostic trace are mutually exclusive")
+        if student_trace and not flags.im_eval:
+            raise ValueError("student traces require the single-environment evaluation player")
+        self._ours_closed_loop_trace_path = (
+            Path(student_trace).expanduser() if student_trace else
+            Path(env["oursClosedLoopTracePath"]).expanduser() if env.get("oursClosedLoopTracePath") else None
+        )
+        self._ours_closed_loop_trace_steps = int(
+            env.get("oursStudentTraceSteps", 0) if student_trace else env.get("oursClosedLoopTraceSteps", 0)
+        )
         self._ours_batch_replay = bool(env.get("oursBatchReplay", False))
         self._ours_action_replay_path = Path(env["oursActionReplayPath"]).expanduser() if env.get("oursActionReplayPath") else None
         self._ours_final_action_replay_path = Path(env["oursFinalActionReplayPath"]).expanduser() if env.get("oursFinalActionReplayPath") else None
@@ -185,8 +195,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         )
         if self._ours_batch_step_trace_path is not None and not self._ours_diagnostic_zero_residual:
             raise ValueError("batch-step trace is restricted to the zero-residual audit")
-        if self._ours_closed_loop_trace_path is not None and not 0 < self._ours_closed_loop_trace_steps <= 64:
-            raise ValueError("ours closed-loop trace length must be in [1,64]")
+        max_trace_steps = 4096 if student_trace else 64
+        if self._ours_closed_loop_trace_path is not None and not 0 < self._ours_closed_loop_trace_steps <= max_trace_steps:
+            raise ValueError(f"ours closed-loop trace length must be in [1,{max_trace_steps}]")
         if self._ours_batch_replay and self._ours_batch_step_trace_path is None:
             raise ValueError("bounded batch replay requires a batch-step trace")
         if self._ours_action_replay_path is not None and self._ours_closed_loop_trace_path is None and not self._ours_batch_replay:

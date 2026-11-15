@@ -125,8 +125,12 @@ class HumanoidAMP(Humanoid):
             self.smpl_parser_f = SMPL_Parser(model_path=data_dir, gender="female").to(self.device)
         elif self.humanoid_type in ["smplx"]:
             self.smpl_parser_n = SMPLX_Parser(model_path=data_dir, gender="neutral", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20).to(self.device)
-            self.smpl_parser_m = SMPLX_Parser(model_path=data_dir, gender="male", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20).to(self.device)
-            self.smpl_parser_f = SMPLX_Parser(model_path=data_dir, gender="female", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20).to(self.device)
+            if self._use_case_shape and torch.all(self.humanoid_shapes[:, 0] == 0):
+                self.smpl_parser_m = None
+                self.smpl_parser_f = None
+            else:
+                self.smpl_parser_m = SMPLX_Parser(model_path=data_dir, gender="male", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20).to(self.device)
+                self.smpl_parser_f = SMPLX_Parser(model_path=data_dir, gender="female", use_pca=False, create_transl=False, flat_hand_mean = True, num_betas=20).to(self.device)
 
         self.start = True  # camera flag
         self.ref_motion_cache = {}
