@@ -106,6 +106,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "or pre_contact"
             )
         self._ours_hybrid_start_mask = None
+        self._ours_motion_source = env["oursMotionSource"]
         self._ours_reference_path = Path(env["oursReferencePath"]).expanduser()
         self._ours_reward_weights = dict(env["oursReward"])
         self._ours_progress_phase_detection = (
@@ -679,23 +680,15 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         with np.load(self._ours_reference_path, allow_pickle=False) as data:
             if "traj_lengths" in data.files:
                 needed.add("traj_lengths")
-            if "finger_contact_label_source" in data.files:
-                needed.add("finger_contact_label_source")
-            self._ours_recon_contact_region = (
-                "finger_contact_label_source" in data.files
-                and str(np.asarray(data["finger_contact_label_source"]).reshape(-1)[0]) == "recon_preprocess_vlm"
-            )
+            motion_source = self._ours_motion_source
+            if motion_source not in ("recon_result", "dataset"):
+                raise ValueError("Ours requires recon_result or dataset motion_source")
+            self._ours_recon_contact_region = motion_source == "recon_result"
+            needed.add("finger_contact_label_source")
+            if str(np.asarray(data["finger_contact_label_source"]).reshape(-1)[0]) != motion_source:
+                raise ValueError("Ours input motion_source differs from the selected route; rebuild inputs")
             if self._ours_needs_part_attribution and not self._ours_recon_contact_region:
                 needed.add("finger_contact_nearest_object_link_names")
-                has_part_names = "finger_contact_part_link_names" in data.files
-                has_part_schema = "finger_contact_part_schema" in data.files
-                if has_part_names != has_part_schema:
-                    raise ValueError("Studio part-aware finger GT fields must appear together")
-                if has_part_names:
-                    needed.update((
-                        "finger_contact_part_link_names",
-                        "finger_contact_part_schema",
-                    ))
             missing = sorted(needed.difference(data.files))
             if missing:
                 raise ValueError("Studio articulated reference lacks: " + ", ".join(missing))
@@ -880,10 +873,7 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 axis=1,
             )
             obj_ref = np.any(labels_hand2 > 0.5, axis=1, keepdims=True).astype(np.float32)
-        if (
-            "finger_contact_label_source" in self._ours_reference_np
-            and str(np.asarray(self._ours_reference_np["finger_contact_label_source"]).reshape(-1)[0]) == "recon_preprocess_vlm"
-        ):
+        if self._ours_recon_contact_region:
             names = [str(name) for name in self._ours_reference_np["finger_contact_body_names"].reshape(-1)]
             indices = [names.index(self._contact_label_to_body_name(name)) for name in self._phc_contact_label_names_10]
             labels = np.asarray(self._ours_reference_np["finger_contact_labels"])[..., indices].astype(np.float32)
@@ -1133,15 +1123,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             str(name)
             for name in self._phc_object_config["contact_region_point_link_names"]
         ]
-        if self._ours_recon_contact_region or (
-            "finger_contact_label_source" in ref
-            and str(np.asarray(ref["finger_contact_label_source"]).reshape(-1)[0]) == "arctic_gt_full_object"
-        ):
-            expected_points = np.asarray(ref["finger_contact_surface_points_link_local_scaled"], dtype=np.float32)
-            expected_names = point_names("finger_contact_surface_point_link_names")
-        else:
-            expected_points = surface_points
-            expected_names = surface_names
+        expected_points = np.asarray(ref["finger_contact_surface_points_link_local_scaled"], dtype=np.float32)
+        expected_names = point_names("finger_contact_surface_point_link_names")
         if (
             contact_names != expected_names[0].tolist()
             or not np.array_equal(contact_points, expected_points[0] if expected_points.ndim == 3 else expected_points)
@@ -1182,13 +1165,6 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         finger_surface_names = point_names("finger_contact_surface_point_link_names")
         if set(finger_surface_names.reshape(-1)).difference(object_names):
             raise ValueError("Studio finger contact surface names are absent from the object")
-        if (
-            "finger_contact_label_source" not in ref
-            or str(np.asarray(ref["finger_contact_label_source"]).reshape(-1)[0]) != "recon_preprocess_vlm"
-        ) and (
-            any(child not in set(names) or not set(names).difference({child}) for names, child in zip(finger_surface_names, self._ours_child_links))
-        ):
-            raise ValueError("Studio finger contact surface must include active and fixed links")
         self._ours_finger_surface_points_local = torch.tensor(
             ref["finger_contact_surface_points_link_local_scaled"],
             dtype=torch.float32,
