@@ -294,6 +294,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_opening_q_count = torch.zeros(
             (), dtype=torch.int64, device=self.device,
         )
+        self._ours_pending_reset_states = {}
+        self._ours_recovering = False
+        self._ours_numerical_invalid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._ours_numerical_events = 0
         self._ours_bind_studio_tensors()
         self._compute_observations()
         self._ours_capture_trace()
@@ -1583,7 +1587,40 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
                 "solver_pre_dof_vel": self._ours_numpy(self._dof_vel[0]),
             })
 
+    def _refresh_sim_tensors(self):
+        super()._refresh_sim_tensors()
+        if flags.im_eval or not hasattr(self, "_ours_numerical_invalid"):
+            return
+        from pipeline.physics.ours.numerical import invalid_env_ids, restore_reset_body_states
+
+        restore_reset_body_states(self)
+        if self._ours_recovering:
+            return
+        bad = invalid_env_ids(self)
+        if not len(bad):
+            return
+        if len(bad) == self.num_envs:
+            raise FloatingPointError("Every training environment has invalid simulator state")
+        self._ours_numerical_invalid[bad] = True
+        self._ours_numerical_events += len(bad)
+        event = {"invalid_env_count": len(bad), "env_ids": bad[:20].tolist(),
+                 "reference_frames": self._ours_frames()[bad[:20]].tolist(),
+                 "total_invalid_transitions": self._ours_numerical_events}
+        self._ours_recovering = True
+        try:
+            self._reset_envs(bad)
+        finally:
+            self._ours_recovering = False
+        remaining = invalid_env_ids(self)
+        if len(remaining):
+            raise FloatingPointError(f"Native numerical recovery failed for environments {remaining[:20].tolist()}")
+        with self._ours_eval_path.with_name("numerical_events.jsonl").open("a") as stream:
+            stream.write(json.dumps(event) + "\n")
+        print(f"[ours numerical recovery] invalid={len(bad)}/{self.num_envs}, total={self._ours_numerical_events}", flush=True)
+
     def _physics_step(self):
+        if not self.paused and self.enable_viewer_sync:
+            self._ours_pending_reset_states.clear()
         if self._ours_closed_loop_pending is None and not self._ours_batch_replay:
             return super()._physics_step()
         substeps = []
@@ -2113,6 +2150,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_action_rate_valid[:] = True
         self._ours_reward_count += 1
         opening = phase_active & (phase_direction > 0.0)
+        if not flags.im_eval:
+            opening &= ~self._ours_numerical_invalid
         opening_weight = opening.to(dtype=torch.float64)
         self._ours_opening_q_sum += (
             terms["active_hinge_q"].detach().to(dtype=torch.float64)
@@ -2142,6 +2181,8 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             "progress_metric",
         }
         for name, value in values.items():
+            if not flags.im_eval and value.ndim and value.shape[0] == self.num_envs:
+                value = value[~self._ours_numerical_invalid]
             if name not in self._ours_reward_sum:
                 self._ours_reward_sum[name] = torch.zeros((), device=self.device)
             self._ours_reward_sum[name] += value.detach().mean()
@@ -2160,9 +2201,10 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
             self._ours_reward_max[name] = torch.maximum(
                 self._ours_reward_max[name], value.detach().amax(),
             )
-        progress = terms["progress_metric"].detach().reshape(-1)
+        valid = torch.ones(self.num_envs, dtype=torch.bool, device=self.device) if flags.im_eval else ~self._ours_numerical_invalid
+        progress = terms["progress_metric"].detach().reshape(-1)[valid]
         peak_progress, peak_index = progress.max(dim=0)
-        peak_q = terms["active_hinge_q"].detach().reshape(-1).gather(
+        peak_q = terms["active_hinge_q"].detach().reshape(-1)[valid].gather(
             0, peak_index.reshape(1),
         )[0]
         if self._ours_peak_progress is None:
@@ -2331,6 +2373,9 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         return result
 
     def _reset_env_tensors(self, env_ids):
+        if not flags.im_eval and hasattr(self, "_ours_pending_reset_states"):
+            from pipeline.physics.ours.numerical import capture_reset_body_states
+            capture_reset_body_states(self, env_ids)
         humanoid_ids = self._humanoid_actor_ids[env_ids]
         target_ids = self._tar_actor_ids[env_ids]
         combined_ids = torch.cat((humanoid_ids, target_ids)).to(torch.int32)
@@ -2654,7 +2699,16 @@ class HumanoidImStudioResidual(HumanoidImPassiveObject):
         self._ours_outputs_finalized = True
 
     def post_physics_step(self):
+        if not flags.im_eval:
+            self._ours_numerical_invalid.zero_()
         super().post_physics_step()
+        if not flags.im_eval:
+            invalid = self._ours_numerical_invalid
+            self.rew_buf[invalid] = 0
+            self.reward_raw[invalid] = 0
+            self.reset_buf[invalid] = 1
+            self._terminate_buf[invalid] = 1
+            self.extras["numerical_invalid"] = invalid.clone()
         if not hasattr(self, "_ours_pnn"):
             return
         self._ours_capture_evaluation_telemetry()
